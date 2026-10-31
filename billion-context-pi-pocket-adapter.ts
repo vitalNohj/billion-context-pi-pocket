@@ -30,14 +30,11 @@ import {
     existsSync,
     mkdirSync,
     readFileSync,
-    realpathSync,
     renameSync,
     writeFileSync,
 } from "node:fs";
-import { registerHooks } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
     AgentDoc,
     CompactionTask,
@@ -52,13 +49,13 @@ import {
 // ---- settings ----
 
 const SETTINGS_FILE = "billion-context-pi-pocket-adapter.json";
-/** billion-context-pi versions this adapter is tested with. Others run, with a warning. */
+/** Updated with the pinned bundle; a refresh is committed only after the tests pass. */
 const TESTED_BCP_VERSIONS = ["0.1.83"];
 /** In tool-result details. Histories made by earlier versions of this adapter carry it: keep it. */
 export const CHECKPOINT_KEY = "pocketBcpCheckpoint";
 
 interface Settings {
-    /** billion-context-pi's package folder. Default: where `pi install npm:billion-context-pi` puts it. */
+    /** Legacy setting. Ignored: this adapter always runs its own pinned bundle. */
     billionContextPi?: string;
     /** Compression state. Relative to Pi Pocket's data folder. Default: "billion-context-pi". */
     stateDir?: string;
@@ -88,56 +85,40 @@ const extensionName = settings.extensionName ?? "billion-context-pi";
 
 // ---- billion-context-pi ----
 
-const bcpDir = resolve(
-    here,
-    settings.billionContextPi ?? join(getAgentDir(), "npm", "node_modules", "billion-context-pi"),
-);
-const bcpPackagePath = join(bcpDir, "package.json");
-if (!existsSync(bcpPackagePath)) {
+const bundleDir = join(here, "billion-context-pi-pocket-adapter");
+const bundlePath = join(bundleDir, "bundle.json");
+function missingBundle(): never {
     throw new Error(
-        `billion-context-pi is not installed at ${bcpDir}. Install it with \`pi install npm:billion-context-pi\`, ` +
-            `or set "billionContextPi" in ${settingsPath} to its package folder.`,
+        `The bundled billion-context-pi is missing at ${bundleDir}. Copy the ` +
+            `billion-context-pi-pocket-adapter/ folder together with this adapter. No separate pi install is needed.`,
     );
 }
+if (!existsSync(bundlePath)) missingBundle();
+const bundle = JSON.parse(readFileSync(bundlePath, "utf8"));
+if (bundle.package !== "billion-context-pi" || !/^\d+\.\d+\.\d+$/.test(bundle.version)) {
+    throw new Error(`Invalid billion-context-pi bundle metadata at ${bundlePath}`);
+}
+export const BCP_VERSION: string = bundle.version;
+// Version every import path so a reload cannot reuse the previous runtime's
+// entry or relative child modules from Node's module cache.
+const bcpDir = join(bundleDir, `billion-context-pi-${BCP_VERSION}`);
+const bcpPackagePath = join(bcpDir, "package.json");
+if (!existsSync(bcpPackagePath) || !existsSync(join(bcpDir, "dist", "index.js"))) missingBundle();
 const bcpPackage = JSON.parse(readFileSync(bcpPackagePath, "utf8"));
-if (bcpPackage.name !== "billion-context-pi") {
-    throw new Error(`${bcpDir} is not billion-context-pi (its package is "${bcpPackage.name}")`);
+if (bcpPackage.name !== "billion-context-pi" || bcpPackage.version !== BCP_VERSION) {
+    throw new Error(`Bundled package metadata does not match billion-context-pi ${BCP_VERSION}`);
 }
-export const BCP_VERSION: string = bcpPackage.version;
-const bcpEntry: string = bcpPackage.exports?.["."]?.import ?? bcpPackage.main ?? "dist/index.js";
-
-/**
- * billion-context-pi imports the packages pi provides to its extensions (`@earendil-works/pi-coding-agent` and the
- * rest) without installing them. Resolve those from this folder instead: its `node_modules` links to Pi Pocket's,
- * so billion-context-pi gets the very modules the server runs. Registered once per process; a reload only moves it.
- */
-const HOST_PACKAGES = /^(?:@earendil-works\/(?:pi-ai|pi-agent-core|pi-coding-agent|pi-tui)|typebox)(?:\/|$)/;
-const redirect = Symbol.for("billion-context-pi-pocket-adapter.resolve");
-type Redirect = { from: string; to: string };
-const store = globalThis as typeof globalThis & { [redirect]?: { current: Redirect } };
-if (store[redirect] === undefined) {
-    const state = { current: { from: "", to: "" } };
-    store[redirect] = state;
-    registerHooks({
-        resolve(specifier, context, next) {
-            const { from, to } = state.current;
-            if (from !== "" && context.parentURL?.startsWith(from) === true && HOST_PACKAGES.test(specifier)) {
-                return next(specifier, { ...context, parentURL: to });
-            }
-            return next(specifier, context);
-        },
-    });
+if (settings.billionContextPi !== undefined) {
+    console.warn(`[bcp-adapter] The legacy billionContextPi setting is ignored; using bundled billion-context-pi ${BCP_VERSION}.`);
 }
-store[redirect]!.current = {
-    from: pathToFileURL(realpathSync(bcpDir)).href + "/",
-    to: pathToFileURL(join(here, SETTINGS_FILE)).href,
-};
 
-// Read by billion-context-pi as it loads and on every event: set before it loads. These are process-wide.
+// These are process-wide, as in earlier adapters. Set them before importing BCP.
 process.env.PI_ACP_FORK_HOST = "1";
-// Checkpoints are made for one version: a server must not npm-install a newer one under itself.
+// A running server must not replace the version its checkpoints were made for.
+// Repository updates, not BCP's runtime npm updater, replace this pinned copy.
 process.env.ACP_AUTO_UPDATE = "0";
-const bcp = await import(pathToFileURL(join(bcpDir, bcpEntry)).href);
+// Host packages resolve normally through Pi Pocket's extensions/node_modules link.
+const bcp = await import(pathToFileURL(join(bcpDir, "dist", "index.js")).href);
 const factory = bcp.default as (pi: unknown) => unknown;
 const deriveChildState = bcp.deriveChildState as ((state: any) => any) | undefined;
 if (typeof factory !== "function" || typeof deriveChildState !== "function") {

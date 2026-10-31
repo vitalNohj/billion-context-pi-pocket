@@ -2,17 +2,16 @@
  * The adapter loaded the way Pi Pocket loads it: a drop-in in a test app's data folder, turned on, with a scripted
  * model (nothing reaches a provider). Needs a Pi Pocket checkout: `PI_POCKET_CHECKOUT=/path/to/pi-pocket npm test`.
  */
-import "./env.ts";
+import { testHome } from "./env.ts";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 
 const repo = resolve(import.meta.dirname, "..");
 const ADAPTER = "billion-context-pi-pocket-adapter.ts";
-const bcpDir = join(repo, "node_modules", "billion-context-pi");
+const BUNDLE = "billion-context-pi-pocket-adapter";
 const pocketDir = process.env.PI_POCKET_CHECKOUT;
 const skip =
     pocketDir === undefined
@@ -20,6 +19,7 @@ const skip =
         : existsSync(join(pocketDir, "test", "helpers.ts"))
           ? false
           : `no Pi Pocket checkout at ${pocketDir}`;
+if (process.env.CI && skip !== false) throw new Error(`Integration tests must not skip in CI: ${skip}`);
 
 let h: any;
 let app: any;
@@ -30,9 +30,10 @@ let mod: any;
 const CHECKPOINT_KEY = "pocketBcpCheckpoint";
 
 /** A drop-in folder with the adapter, its settings, and Pi Pocket's packages, as Pi Pocket makes it. */
-function dropInFolder(folder: string, settings: Record<string, string>): string {
+function dropInFolder(folder: string, settings: Record<string, string> = {}, includeBundle = true): string {
     mkdirSync(folder, { recursive: true });
     copyFileSync(join(repo, ADAPTER), join(folder, ADAPTER));
+    if (includeBundle) cpSync(join(repo, BUNDLE), join(folder, BUNDLE), { recursive: true });
     writeFileSync(join(folder, "billion-context-pi-pocket-adapter.json"), JSON.stringify(settings));
     return join(folder, ADAPTER);
 }
@@ -44,7 +45,7 @@ if (skip === false) {
     );
     const { work, root, lastText, scriptedModel, openApp, owner, cleanUp } = h;
     dataDir = join(root, "data-bcp");
-    dropin = dropInFolder(join(dataDir, "extensions"), { billionContextPi: bcpDir });
+    dropin = dropInFolder(join(dataDir, "extensions"));
     writeFileSync(join(work, "A.log"), "OLD_LOG_A: original diagnostics\n".repeat(200));
     writeFileSync(join(work, "B.log"), "OLD_LOG_B: later diagnostics\n".repeat(200));
 
@@ -80,7 +81,11 @@ if (skip === false) {
             return call("compress", args);
         }
         if (role === "user" && text.includes("unfold")) {
-            return call("decompress", { blockId: "b1", inline: true });
+            return call("decompress", {
+                blockId: "b1",
+                ...(text.includes("custom") ? { toFile: join(testHome, "custom-decompression.txt") }
+                    : text.includes("file") ? {} : { inline: true }),
+            });
         }
         return fauxAssistantMessage([fauxText(role === "toolResult" ? "Completed." : "Continued.")]);
     });
@@ -254,8 +259,8 @@ test("branch entry IDs match billion-context-pi's own", { skip }, async () => {
             timestamp: 3,
         },
     ];
-    // Loaded after the adapter, so its imports of Pi's packages resolve to Pi Pocket's.
-    const { createRuntime } = await import(pathToFileURL(join(bcpDir, "dist", "index.js")).href);
+    // Use the deployed bundle, without the repository's development dependencies.
+    const { createRuntime } = await import(pathToFileURL(join(dataDir, "extensions", BUNDLE, `billion-context-pi-${mod.BCP_VERSION}`, "dist", "index.js")).href);
     const ctx = {
         model: { contextWindow: 128000 },
         sessionManager: { getSessionId: () => "ids", getSessionFile: () => undefined, getBranch: () => [] },
@@ -268,18 +273,61 @@ test("branch entry IDs match billion-context-pi's own", { skip }, async () => {
 });
 
 test("settings: the state folder and extension name are configurable", { skip }, async () => {
-    const folder = mkdtempSync(join(tmpdir(), "bcp-pocket-adapter-settings-"));
+    const folder = mkdtempSync(join(testHome, "settings-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
-    const file = dropInFolder(folder, { billionContextPi: bcpDir, stateDir: "bcp", extensionName: "bcp-adapter" });
+    const file = dropInFolder(folder, { stateDir: "bcp", extensionName: "bcp-adapter" });
     const configured = await import(pathToFileURL(file).href);
     const extension = configured.default({ dataDir: folder, notice() {} });
     assert.equal(extension.name, "bcp-adapter");
     assert.ok(existsSync(join(folder, "bcp")));
 });
 
-test("a missing billion-context-pi says how to install it", { skip }, async () => {
-    const folder = mkdtempSync(join(tmpdir(), "bcp-pocket-adapter-missing-"));
+test("a missing bundle says to copy the helper folder, without a separate pi install", { skip }, async () => {
+    const folder = mkdtempSync(join(testHome, "missing-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
-    const file = dropInFolder(folder, { billionContextPi: join(folder, "nowhere") });
-    await assert.rejects(import(pathToFileURL(file).href), /pi install npm:billion-context-pi/);
+    const file = dropInFolder(folder, {}, false);
+    await assert.rejects(import(pathToFileURL(file).href), /Copy the billion-context-pi-pocket-adapter\/ folder/);
+});
+
+test("legacy package paths cannot override the pinned bundle", { skip }, async () => {
+    const folder = mkdtempSync(join(testHome, "legacy-"));
+    symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
+    const file = dropInFolder(folder, { billionContextPi: join(folder, "not-installed") });
+    const configured = await import(pathToFileURL(file).href);
+    const manifest = JSON.parse(readFileSync(join(folder, BUNDLE, "bundle.json"), "utf8"));
+    assert.equal(configured.BCP_VERSION, manifest.version);
+    assert.equal(configured.default({ dataDir: folder, notice() {} }).tools.length, 5);
+});
+
+test("a version update reloads the entry and its relative child imports", { skip }, async () => {
+    const folder = mkdtempSync(join(testHome, "reload-"));
+    symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
+    const file = dropInFolder(folder);
+    const first = await import(pathToFileURL(file).href);
+    assert.equal(first.BCP_VERSION, mod.BCP_VERSION);
+    const nextVersion = "999.0.0";
+    const runtime = join(folder, BUNDLE, `billion-context-pi-${nextVersion}`);
+    mkdirSync(join(runtime, "dist"), { recursive: true });
+    writeFileSync(join(runtime, "package.json"), JSON.stringify({ name: "billion-context-pi", version: nextVersion, type: "module" }));
+    writeFileSync(join(runtime, "dist", "child.js"), 'export const marker = "NEW_BUNDLED_CHILD_LOADED";');
+    writeFileSync(join(runtime, "dist", "index.js"), 'import { marker } from "./child.js"; throw new Error(marker);');
+    writeFileSync(join(folder, BUNDLE, "bundle.json"), JSON.stringify({ package: "billion-context-pi", version: nextVersion }));
+    await assert.rejects(import(`${pathToFileURL(file).href}?updated`), /NEW_BUNDLED_CHILD_LOADED/);
+});
+
+test("decompression keeps both automatic and custom file output", { skip }, async () => {
+    const { context, newSession, say } = h;
+    const id = await newSession(app);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    await say(app, id, "unfold-file");
+    const cache = join(testHome, ".cache", "pi", "acp-decompress");
+    const outputs = readdirSync(cache).filter((name) => name.startsWith("b1-"));
+    assert.ok(outputs.length > 0, "default output goes to the normal cache directory");
+    assert.ok(outputs.some((name) => readFileSync(join(cache, name), "utf8").includes("OLD_LOG_A")));
+    await say(app, id, "unfold-custom");
+    const messages = await (await app.harness.conversation(id, context)).context(context);
+    const result = messages.messages.findLast((m: any) => m.role === "toolResult" && m.toolName === "decompress");
+    assert.notEqual(result.isError, true);
+    assert.match(readFileSync(join(testHome, "custom-decompression.txt"), "utf8"), /OLD_LOG_A/);
 });
