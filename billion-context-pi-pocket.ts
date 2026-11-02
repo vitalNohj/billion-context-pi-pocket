@@ -28,12 +28,17 @@
 import { createHash } from "node:crypto";
 import {
     existsSync,
+    lstatSync,
     mkdirSync,
     readFileSync,
+    readlinkSync,
+    realpathSync,
     renameSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
     AgentDoc,
@@ -297,14 +302,111 @@ type PiTool = {
  * Tools that only change what the model sees of the conversation, never files, commands, or anything outside it, so
  * Pocket's plan mode may run them. The delegate tools start subagents and stay blocked there.
  */
-const CONTEXT_ONLY = new Set(["compress", "decompress", "search_context", "acp_status", "acp_cache"]);
+const CONTEXT_ONLY = new Set(["compress", "search_context", "acp_status", "acp_cache"]);
 
 /** The tool's own annotations, marked read-only when it only changes the model's view (Pocket's plan mode reads it). */
 function annotationsOf(tool: PiTool): { annotations?: Record<string, unknown> } {
+    // A requested export calls Pocket's write tool. Do not promise that this tool is read-only, even when that write
+    // is itself guarded. Pocket currently checks the outer tool before it can make a nested call.
+    if (tool.name === "decompress") {
+        return { annotations: { ...tool.annotations, readOnlyHint: false } };
+    }
     if (!CONTEXT_ONLY.has(tool.name)) {
         return tool.annotations === undefined ? {} : { annotations: tool.annotations };
     }
     return { annotations: { ...tool.annotations, readOnlyHint: true } };
+}
+
+/**
+ * Preserve billion-context-pi 0.1.83's temp/cache destination policy. Adapted from its MIT-licensed
+ * src/decompress-tool.ts; the upstream source, version, and license are retained in the bundled runtime.
+ * Only Pocket's write tool receives this destination: BCP receives a separate extension-created scratch file.
+ */
+function decompressionDestination(targetPath: string): string | { error: string } {
+    const expanded = targetPath.startsWith("~/") ? join(homedir(), targetPath.slice(2)) : targetPath;
+    let checked = resolve(expanded);
+    let probe = checked;
+    const suffix: string[] = [];
+    while (!existsSync(probe) && probe !== dirname(probe)) {
+        suffix.unshift(basename(probe));
+        probe = dirname(probe);
+    }
+    checked = existsSync(probe) ? realpathSync(probe) : probe;
+    for (const part of suffix) {
+        checked = join(checked, part);
+        try {
+            if (lstatSync(checked).isSymbolicLink()) {
+                const target = readlinkSync(checked);
+                checked = isAbsolute(target) ? resolve(target) : resolve(dirname(checked), target);
+            }
+        } catch {
+            // The destination or a parent does not exist yet, just as in the upstream resolver.
+        }
+    }
+    const allowed = [tmpdir(), join(homedir(), ".cache", "opencode"), join(homedir(), ".cache", "pi")];
+    const permitted = allowed.some((folder) => {
+        let root = folder;
+        try { root = realpathSync(folder); } catch { /* A cache folder need not exist yet. */ }
+        const path = relative(root, checked);
+        return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+    });
+    return permitted ? checked : {
+        error: `Error: toFile path must be under ${tmpdir()}, ~/.cache/opencode, or ~/.cache/pi. Got: ${targetPath}`,
+    };
+}
+
+/**
+ * A requested export remains one decompress call to the model. BCP restores into our scratch file; the actual
+ * destination is written only by a nested Pocket write call, so its guards, approvals, and wrappers still apply.
+ * Automatic output and inline decompression do not use this path and keep upstream behavior.
+ */
+export async function decompressToFile(
+    tool: PiTool,
+    args: Record<string, unknown> & { toFile: string },
+    toolApi: any,
+    context: any,
+    ctx: any,
+): Promise<any> {
+    const destination = decompressionDestination(args.toFile);
+    const failure = (text: string) => ({ isError: true, content: [{ type: "text", text }] });
+    if (typeof destination !== "string") return failure(destination.error);
+    if (typeof toolApi.executeTool !== "function") {
+        return failure("Cannot save decompressed text: this Pocket version has no guarded nested tool execution. No destination file was written.");
+    }
+    const scratch = await mkdtemp(join(tmpdir(), "billion-context-pi-pocket-decompress-"));
+    const file = join(scratch, "restored.txt");
+    try {
+        const result = await tool.execute(
+            toolApi.callId, { ...args, toFile: file }, context.abortSignal, undefined, ctx,
+        );
+        if (result?.isError === true) return result;
+        let content: string;
+        try {
+            content = await readFile(file, "utf8");
+        } catch (error: any) {
+            // Invalid refs, missing blocks, and refused runtimes return explanatory text without creating a file.
+            if (error.code === "ENOENT") return result;
+            throw error;
+        }
+        const written = await toolApi.executeTool(
+            "write", { path: destination, content }, context, { key: "decompressed-file" },
+        );
+        if (written.isError) {
+            const reason = written.diagnostics?.map((item: any) => item.message).filter(Boolean).join("\n")
+                || (typeof written.structuredOutput === "string" ? written.structuredOutput : "Pocket's write tool did not save the file.");
+            return failure(`Could not save decompressed text to ${destination}.\n${reason}`);
+        }
+        return {
+            ...result,
+            content: result.content?.map((part: any) => part.type === "text"
+                ? { ...part, text: part.text.replace(file, () => destination) }
+                : part),
+        };
+    } finally {
+        await rm(scratch, { recursive: true, force: true }).catch((error) => {
+            ctx.ui.notify(`Could not remove decompression scratch folder ${scratch}: ${String(error)}`, "warning");
+        });
+    }
 }
 
 /** A value that survives JSON (Pi Durable stores details as JSON). */
@@ -446,11 +548,14 @@ export default function createBillionContextPiPocket(host: Host) {
             description: tool.description,
             parameters: tool.parameters,
             ...annotationsOf(tool),
-            // compress changes saved state: a repeat after a restart must come back as interrupted, not run twice.
-            replay: tool.name === "compress" ? "unsafe" : "safe",
+            // Compression changes state; decompression can save a requested file. Neither may repeat after a crash.
+            replay: tool.name === "compress" || tool.name === "decompress" ? "unsafe" : "safe",
             execute: async (args: unknown, toolApi: any, context: any) => {
                 const ctx = await contextFor(toolApi, context);
-                const result = await tool.execute(toolApi.callId, args, undefined, undefined, ctx);
+                const params = args as Record<string, unknown>;
+                const result = tool.name === "decompress" && typeof params.toFile === "string" && params.toFile !== ""
+                    ? await decompressToFile(tool, params as Record<string, unknown> & { toFile: string }, toolApi, context, ctx)
+                    : await tool.execute(toolApi.callId, args, context.abortSignal, undefined, ctx);
                 return {
                     content: result?.content ?? [{ type: "text" as const, text: "" }],
                     ...(result?.isError === true ? { isError: true } : {}),

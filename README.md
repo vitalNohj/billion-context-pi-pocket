@@ -76,7 +76,11 @@ All optional. Put them in `billion-context-pi-pocket.json`, next to the `.ts` fi
 
 An older `billionContextPi` setting is ignored; the extension always uses its included runtime. You can leave that setting in an existing file. Keep your existing `stateDir` and `extensionName` to keep using the same sessions and state.
 
-billion-context-pi's own settings stay in `~/.pi/acp.json`, with its log in `~/.pi/acp.log`. Its tools keep upstream behavior, including automatic decompression output and custom output paths.
+billion-context-pi's own settings stay in `~/.pi/acp.json`, with its log in `~/.pi/acp.log`. Automatic decompression output and inline restoration keep upstream behavior. For a non-empty `toFile`, the extension restores the text into a private temporary file, then calls Pocket's normal `write` tool internally. The model still makes one `decompress` call with the same arguments; it does not need a follow-up write call. The requested destination is never written directly by BCP.
+
+Custom destinations retain upstream's restriction to the system temporary folder, `~/.cache/opencode`, or `~/.cache/pi`. Pocket's normal write checks, wrappers, and any required approval apply. A denied, unavailable, or failed write returns a decompression error without a direct-write fallback. Temporary export files are removed after success or failure. These working files are separate from saved ACP state and fork checkpoints.
+
+Requested file saves require Pi Durable's `executeTool` API, supplied by the tested Pocket v0.27.0. An older or incompatible Pocket fails closed instead of bypassing its file tools. An interrupted `decompress` call is not automatically replayed, because it may already have saved a file.
 
 A settings change takes effect when the extension reloads. Save the `.ts` file, or turn the extension off and on again.
 
@@ -96,7 +100,9 @@ Checkpoints are stored in `checkpoints/` inside the state folder, one file per s
 
 ## Plan mode
 
-The extension marks `compress`, `decompress`, `search_context`, `acp_status`, and `acp_cache` as read-only (`annotations: { readOnlyHint: true }`), since they change only what the model sees. A Pi Pocket that permits read-only tools in plan mode keeps compression working while Pi plans; an older one blocks them until the plan is approved. Delegate tools start subagents, so they stay blocked in plan mode.
+The extension marks `compress`, `search_context`, `acp_status`, and `acp_cache` as read-only (`annotations: { readOnlyHint: true }`), since they change only the conversation context. Compression and search remain available while Pi plans.
+
+`decompress` keeps its existing name and arguments, including `toFile`, but is **not** marked read-only: it can save a requested file. Pocket currently checks the outer tool before any nested write, so **all `decompress` calls are blocked in plan mode**, even `inline: true`. Approve or leave plan mode before decompression. This is a permission correction, not a move or reset of ACP data. Delegate tools that start subagents also remain blocked.
 
 ## Terminal-only features
 
@@ -121,7 +127,7 @@ PI_POCKET_CHECKOUT=/path/to/pi-pocket npm test
 
 Use `npm run bundle` to regenerate the checked-in runtime and notices from the pinned dependencies. Use `npm run check-upstream` to check for a new stable release, and `npm run refresh -- <version>` to refresh the pins and bundle. The exact version, npm integrity, source commit, and bundled dependency versions are recorded in `upstream.json` and the helper folder's `bundle.json`.
 
-The tests copy the extension and bundle outside this repository. They load them through a test Pocket app's `extensions/node_modules` link. A scripted model makes no real provider requests. A temporary home folder keeps your `~/.pi`, Pi Pocket data, and live extension untouched. Tests cover registration, compression, forks, reloads, automatic and custom decompression output, and settings compatibility. CI rejects a missing Pocket checkout instead of silently skipping those tests.
+The tests copy the extension and bundle outside this repository. They load them through a test Pocket app's `extensions/node_modules` link. A scripted model makes no real provider requests. A temporary home folder keeps your `~/.pi`, Pi Pocket data, and live extension untouched. Tests cover registration, compression, forks, reloads, automatic and custom decompression output, unchanged tool parameters, settings compatibility, and plan-mode restrictions. They exercise Pocket's actual guard hook and approval machinery with controlled allow/block/ask verdicts, not the downloaded Lancet classifier. Tests also verify one model call, denied-write preservation, write failures, private scratch-file cleanup, and fail-closed behavior. CI rejects a missing Pocket checkout instead of silently skipping those tests.
 
 ## Licenses
 

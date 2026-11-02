@@ -4,8 +4,9 @@
  */
 import { testHome } from "./env.ts";
 import assert from "node:assert/strict";
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 
@@ -30,6 +31,7 @@ let dropin = "";
 let lastRequest: readonly any[] = [];
 let mod: any;
 let model: any;
+let requestCount = 0;
 const CHECKPOINT_KEY = "pocketBcpCheckpoint";
 
 /** A drop-in folder with the adapter, its settings, and Pi Pocket's packages, as Pi Pocket makes it. */
@@ -53,10 +55,15 @@ if (skip === false) {
     writeFileSync(join(work, "B.log"), "OLD_LOG_B: later diagnostics\n".repeat(200));
 
     model = scriptedModel((request: any) => {
+        requestCount += 1;
         lastRequest = request.messages;
         const { role, text } = lastText(request);
         const call = (name: string, args: any) =>
             fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
+        const requestedDecompression = /decompress-json:(\{[^\n]*\})/.exec(text);
+        if (role === "user" && requestedDecompression) {
+            return call("decompress", JSON.parse(requestedDecompression[1]));
+        }
         if (role === "user" && /read ([AB])/.test(text)) {
             return call("read", { path: join(work, `${/read ([AB])/.exec(text)![1]}.log`) });
         }
@@ -94,6 +101,8 @@ if (skip === false) {
     });
     app = await openApp(model, dataDir);
     await app.setExtensionEnabled(owner(app), ADAPTER, true);
+    // The helper disables the classifier; explicitly enable Pocket's guard hook so controlled verdicts exercise it.
+    await app.setExtensionEnabled(owner(app), "guard.ts", true);
     mod = await import(pathToFileURL(dropin).href);
     after(async () => {
         await app.close();
@@ -103,6 +112,8 @@ if (skip === false) {
 
 const stateFile = (id: unknown) => join(dataDir, "billion-context-pi", `${id}.jsonl.acp.json`);
 const state = (id: unknown) => JSON.parse(readFileSync(stateFile(id), "utf8"));
+// Normal requests age blocks; compare compressed content and active/restored state, not those maintenance counters.
+const blockContent = (id: unknown) => JSON.stringify(state(id).blocks.map(({ survivedCount: _age, generation: _generation, ...block }: any) => block));
 const tail = async (conversation: any) => (await conversation.entries({}, 1, undefined, h.context)).items[0].id;
 const textOf = (messages: readonly any[]) => messages.map((m) => JSON.stringify(m.content)).join("\n");
 const continueFork = async (parent: any, at: any) => {
@@ -136,16 +147,17 @@ test("installs billion-context-pi's tools and prompt under the default name", { 
         ["billion_context"],
     );
     assert.ok(
-        extension.tools.every((t: any) => t.annotations?.readOnlyHint === true),
-        "its tools only change what the model sees: marked read-only",
+        extension.tools.filter((t: any) => t.name !== "decompress").every((t: any) => t.annotations?.readOnlyHint === true),
+        "context-only tools remain read-only",
     );
+    const decompress = extension.tools.find((tool: any) => tool.name === "decompress");
+    assert.equal(decompress.annotations.readOnlyHint, false, "a file-capable tool must not promise to be read-only");
+    assert.equal(decompress.replay, "unsafe", "a requested file write cannot repeat after a crash");
+    assert.deepEqual(Object.keys(decompress.parameters.properties).sort(), ["blockId", "full", "inline", "toFile"]);
 });
 
 test("compression keeps working in plan mode, where Pi Pocket lets read-only tools run", { skip }, async () => {
     const { context, newSession, say, owner, modelTexts } = h;
-    if (!readFileSync(join(pocketDir!, "src/server/host.ts"), "utf8").includes("readOnlyTool(")) {
-        return; // A Pi Pocket from before read-only tools in plan mode blocks compress there.
-    }
     const id = await newSession(app);
     await app.commands.setPlan(id, owner(app), true);
     await say(app, id, "read A");
@@ -410,5 +422,267 @@ test("renaming a loaded module and settings keeps compressed sessions, forks, an
         assert.equal(existsSync(join(folder, LEGACY_SETTINGS)), false);
     } finally {
         await migrating.close();
+    }
+});
+
+for (const verdict of ["allow", "block", "approve", "deny"]) {
+    test(`decompress uses Pocket's guard hook: ${verdict}`, { skip, timeout: 20_000 }, async () => {
+        const { context, newSession, say, owner, until } = h;
+        const id = await newSession(app);
+        await say(app, id, "read A");
+        await say(app, id, "fold A");
+        const destination = join(testHome, `guarded-${verdict}.txt`);
+        writeFileSync(destination, "EXISTING_FILE_MUST_NOT_CHANGE_BEFORE_APPROVAL");
+        const blocksBefore = blockContent(id);
+        const calls: any[] = [];
+        const judge = app.guard.judge;
+        // Use the real Pocket guard hook and approval machinery with a deterministic verdict, not a downloaded ML model.
+        app.guard.judge = async (name: string, args: any) => {
+            if (name !== "write") return undefined;
+            calls.push(args);
+            return {
+                subject: args.path,
+                decision: { action: verdict === "approve" || verdict === "deny" ? "ask" : verdict, reason: `TEST_GUARD_${verdict}` },
+            };
+        };
+        const requestsBefore = requestCount;
+        try {
+            const { submissionId } = await app.commands.submit(id, owner(app), {
+                text: `decompress-json:${JSON.stringify({ blockId: "b1", toFile: destination })}`,
+                requestId: crypto.randomUUID(),
+            });
+            if (verdict === "approve" || verdict === "deny") {
+                await until(() => app.approvals.forConversation(id).length === 1, "nested write approval");
+                const [card] = app.approvals.forConversation(id);
+                assert.equal(card.tool, "write", "Pocket asks about its own write tool");
+                assert.equal(readFileSync(destination, "utf8"), "EXISTING_FILE_MUST_NOT_CHANGE_BEFORE_APPROVAL");
+                await app.answerApproval(card.id, verdict === "approve", owner(app));
+            }
+            await (await app.harness.submission(submissionId, context)).wait(context);
+            assert.equal(calls.length, 1, "the only destination write passes through Pocket's guard");
+            assert.equal(calls[0].path, destination);
+            assert.match(calls[0].content, /OLD_LOG_A/);
+            const history = (await (await app.harness.conversation(id, context)).context(context)).messages;
+            const result = history.findLast((message: any) => message.role === "toolResult" && message.toolName === "decompress");
+            assert.ok(result);
+            const saved = verdict === "allow" || verdict === "approve";
+            assert.equal(result.isError === true, !saved);
+            if (saved) {
+                assert.match(readFileSync(destination, "utf8"), /OLD_LOG_A/);
+                assert.match(textOf([result]), new RegExp(`written to ${destination.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+            } else {
+                assert.equal(readFileSync(destination, "utf8"), "EXISTING_FILE_MUST_NOT_CHANGE_BEFORE_APPROVAL");
+                assert.match(textOf([result]), /Could not save decompressed text/);
+                assert.match(textOf([result]), /TEST_GUARD_/);
+                assert.doesNotMatch(textOf([result]), /written to/);
+            }
+            assert.equal(blockContent(id), blocksBefore, "file output does not unfold the saved compressed block");
+            const modelCalls = history.flatMap((message: any) => message.role === "assistant" ? message.content : [])
+                .filter((part: any) => part.type === "toolCall");
+            assert.equal(modelCalls.filter((call: any) => call.name === "decompress").length, 1);
+            assert.equal(modelCalls.filter((call: any) => call.name === "write").length, 0, "the model never makes a follow-up write call");
+            assert.equal(requestCount - requestsBefore, 2, "one tool request and one final answer, with no extra model turn");
+        } finally {
+            for (const card of app.approvals.forConversation(id)) await app.answerApproval(card.id, false, owner(app));
+            app.guard.judge = judge;
+        }
+    });
+}
+
+test("decompress file capability is honestly blocked in plan mode without changing compression", { skip }, async () => {
+    const { context, newSession, say, owner } = h;
+    const id = await newSession(app);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const destination = join(testHome, "planned-decompression.txt");
+    const before = blockContent(id);
+    await app.commands.setPlan(id, owner(app), true);
+    await say(app, id, "unfold");
+    await say(app, id, `decompress-json:${JSON.stringify({ blockId: "b1", toFile: destination })}`);
+    const history = (await (await app.harness.conversation(id, context)).context(context)).messages;
+    const results = history.filter((message: any) => message.role === "toolResult" && message.toolName === "decompress");
+    assert.equal(results.length, 2);
+    assert.ok(results.every((result: any) => result.isError === true));
+    assert.match(textOf(results), /Plan mode is on: The decompress tool can change things/);
+    assert.equal(existsSync(destination), false);
+    assert.equal(blockContent(id), before);
+    await app.commands.approvePlan(id, owner(app));
+    await say(app, id, `decompress-json:${JSON.stringify({ blockId: "b1", toFile: destination })}`);
+    assert.match(readFileSync(destination, "utf8"), /OLD_LOG_A/);
+});
+
+test("decompress propagates a real Pocket write failure without a direct-write fallback", { skip }, async () => {
+    const { context, newSession, say } = h;
+    const id = await newSession(app);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const destination = join(testHome, "decompression-is-a-directory");
+    mkdirSync(destination);
+    await say(app, id, `decompress-json:${JSON.stringify({ blockId: "b1", toFile: destination })}`);
+    const history = (await (await app.harness.conversation(id, context)).context(context)).messages;
+    const result = history.findLast((message: any) => message.role === "toolResult" && message.toolName === "decompress");
+    assert.equal(result.isError, true);
+    assert.match(textOf([result]), /Could not save decompressed text/);
+    assert.equal(statSync(destination).isDirectory(), true);
+});
+
+test("decompress a single message to a file through the same wrapper", { skip }, async () => {
+    const { context, newSession, say } = h;
+    const id = await newSession(app);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const ref = state(id).blocks[0].effectiveMessageIds.find((value: string) => value.startsWith("live-"));
+    assert.ok(ref);
+    const destination = join(testHome, "single-message-decompression.txt");
+    await say(app, id, `decompress-json:${JSON.stringify({ blockId: ref, toFile: destination })}`);
+    const history = (await (await app.harness.conversation(id, context)).context(context)).messages;
+    const result = history.findLast((message: any) => message.role === "toolResult" && message.toolName === "decompress");
+    assert.notEqual(result.isError, true);
+    assert.match(textOf([result]), /Message .* written to/);
+    assert.ok(readFileSync(destination, "utf8").length > 0);
+});
+
+test("decompress retains upstream empty-toFile and inline behavior without calling write", { skip }, async () => {
+    const { newSession, say } = h;
+    const id = await newSession(app);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const judge = app.guard.judge;
+    let writes = 0;
+    app.guard.judge = async (name: string) => { if (name === "write") writes += 1; return undefined; };
+    try {
+        await say(app, id, `decompress-json:${JSON.stringify({ blockId: "b1", toFile: "" })}`);
+        await say(app, id, "unfold");
+        assert.equal(writes, 0, "normal automatic files and inline output remain upstream operations");
+    } finally { app.guard.judge = judge; }
+});
+
+function scratchTool(execute?: (path: string) => unknown) {
+    const paths: string[] = [];
+    return {
+        paths,
+        tool: {
+            name: "decompress", description: "test", parameters: {},
+            async execute(_id: unknown, args: any) {
+                paths.push(args.toFile);
+                assert.equal(statSync(dirname(args.toFile)).mode & 0o777, 0o700, "restored history is in a private scratch directory");
+                if (execute !== undefined) return await execute(args.toFile);
+                writeFileSync(args.toFile, "EXACT_RESTORED_CONTENT");
+                return { content: [{ type: "text", text: `Block b1 written to ${args.toFile}.` }], details: { marker: "retained" } };
+            },
+        },
+    };
+}
+
+for (const outcome of ["success", "blocked", "throws", "upstream-error", "missing-content"]) {
+    test(`decompress scratch cleanup: ${outcome}`, { skip }, async () => {
+        const destination = join(testHome, `scratch-${outcome}-$&.txt`);
+        writeFileSync(destination, "ORIGINAL");
+        const fixture = scratchTool(outcome === "upstream-error" ? () => { throw new Error("UPSTREAM_FAILED"); }
+            : outcome === "missing-content" ? () => ({ content: [{ type: "text", text: "Block b1 not found." }] }) : undefined);
+        let writes = 0;
+        const api = {
+            callId: "decompress-test",
+            async executeTool(name: string, args: any, _context: unknown, options: any) {
+                writes += 1;
+                assert.equal(name, "write");
+                assert.equal(args.path, destination);
+                assert.equal(args.content, "EXACT_RESTORED_CONTENT");
+                assert.equal(options.key, "decompressed-file");
+                assert.equal(readFileSync(destination, "utf8"), "ORIGINAL", "BCP never receives or writes the requested destination");
+                if (outcome === "throws") throw new Error("NESTED_WRITE_ABORTED");
+                if (outcome === "blocked") return { isError: true, diagnostics: [{ message: "GUARD_DENIED" }] };
+                writeFileSync(destination, args.content); // stand-in for the independently tested Pocket write tool
+                return { isError: false };
+            },
+        };
+        const run = () => mod.decompressToFile(fixture.tool, { blockId: "b1", toFile: destination, full: true }, api, h.context, { ui: { notify() {} } });
+        if (outcome === "throws" || outcome === "upstream-error") {
+            await assert.rejects(run(), outcome === "throws" ? /NESTED_WRITE_ABORTED/ : /UPSTREAM_FAILED/);
+        } else {
+            const result = await run();
+            if (outcome === "success") {
+                assert.equal(result.content[0].text, `Block b1 written to ${destination}.`);
+                assert.deepEqual(result.details, { marker: "retained" });
+            } else if (outcome === "blocked") {
+                assert.equal(result.isError, true);
+                assert.match(result.content[0].text, /GUARD_DENIED/);
+                assert.doesNotMatch(result.content[0].text, /written to/);
+            } else assert.equal(result.content[0].text, "Block b1 not found.");
+        }
+        assert.equal(writes, outcome === "upstream-error" || outcome === "missing-content" ? 0 : 1);
+        assert.equal(fixture.paths.length, 1);
+        assert.equal(existsSync(dirname(fixture.paths[0])), false, "scratch text and directory are removed on every exit");
+        if (outcome !== "success") assert.equal(readFileSync(destination, "utf8"), "ORIGINAL");
+    });
+}
+
+test("decompress fails closed without nested tool support or for an upstream-disallowed destination", { skip }, async () => {
+    const fixture = scratchTool();
+    const destination = join(testHome, "unsupported-decompression.txt");
+    const result = await mod.decompressToFile(fixture.tool, { blockId: "b1", toFile: destination }, { callId: "no-nested-api" }, h.context, {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /no guarded nested tool execution/);
+    assert.equal(fixture.paths.length, 0);
+    assert.equal(existsSync(destination), false);
+    const forbidden = await mod.decompressToFile(fixture.tool, { blockId: "b1", toFile: "/etc/bcp-must-not-be-written" }, { executeTool() { assert.fail("must not call write"); } }, h.context, {});
+    assert.equal(forbidden.isError, true);
+    assert.match(forbidden.content[0].text, /toFile path must be under/);
+    const link = join(testHome, "decompression-symlink");
+    symlinkSync("/etc/hostname", link);
+    const symlink = await mod.decompressToFile(fixture.tool, { blockId: "b1", toFile: link }, { executeTool() { assert.fail("must not follow an outside symlink"); } }, h.context, {});
+    assert.equal(symlink.isError, true);
+    assert.equal(fixture.paths.length, 0);
+});
+
+test("decompress works through a disposable HTTP Pocket server with normal approval", { skip, timeout: 20_000 }, async () => {
+    const { context, newSession, owner, until } = h;
+    const { createHandler } = await import(join(pocketDir!, "src/server/http.ts"));
+    const server = createServer(createHandler({ app, listen: { host: "127.0.0.2", port: 0 }, restart() {} }));
+    await new Promise<void>((done) => server.listen(0, "127.0.0.2", done));
+    const origin = `http://127.0.0.2:${(server.address() as { port: number }).port}`;
+    const post = async (path: string, body: unknown) => {
+        const response = await fetch(origin + path, {
+            method: "POST",
+            headers: { authorization: `Bearer ${app.config.ownerToken}`, "x-pocket": "1", "content-type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const result = await response.json();
+        assert.equal(response.status, 200, JSON.stringify(result));
+        return result as any;
+    };
+    const id = await newSession(app);
+    const submit = (text: string) => post(`/api/c/${id}/submit`, { text, requestId: crypto.randomUUID() });
+    const judge = app.guard.judge;
+    try {
+        for (const text of ["read A", "fold A"]) {
+            const { submissionId } = await submit(text);
+            await (await app.harness.submission(submissionId, context)).wait(context);
+        }
+        const destination = join(testHome, "http-decompression.txt");
+        writeFileSync(destination, "WAIT_FOR_POCKET_APPROVAL");
+        app.guard.judge = async (name: string, args: any) => name === "write" ? {
+            subject: args.path,
+            decision: { action: "ask", reason: "HTTP_DECOMPRESS_APPROVAL" },
+        } : undefined;
+        const requestsBefore = requestCount;
+        const { submissionId } = await submit(`decompress-json:${JSON.stringify({ blockId: "b1", toFile: destination })}`);
+        await until(() => app.approvals.forConversation(id).length === 1, "HTTP nested write approval");
+        const [card] = app.approvals.forConversation(id);
+        assert.equal(card.tool, "write");
+        assert.equal(readFileSync(destination, "utf8"), "WAIT_FOR_POCKET_APPROVAL");
+        await post(`/api/approvals/${encodeURIComponent(card.id)}`, { allow: true });
+        await (await app.harness.submission(submissionId, context)).wait(context);
+        assert.match(readFileSync(destination, "utf8"), /OLD_LOG_A/);
+        assert.equal(requestCount - requestsBefore, 2, "HTTP submission needs no extra model turn");
+        const history = (await (await app.harness.conversation(id, context)).context(context)).messages;
+        const result = history.findLast((message: any) => message.role === "toolResult" && message.toolName === "decompress");
+        assert.notEqual(result.isError, true);
+        assert.match(textOf([result]), /written to/);
+    } finally {
+        for (const card of app.approvals.forConversation(id)) await app.answerApproval(card.id, false, owner(app));
+        app.guard.judge = judge;
+        server.closeAllConnections();
+        await new Promise<void>((done) => server.close(() => done()));
     }
 });
