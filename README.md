@@ -84,6 +84,12 @@ Requested file saves require Pi Durable's `executeTool` API, supplied by the tes
 
 A settings change takes effect when the extension reloads. Save the `.ts` file, or turn the extension off and on again.
 
+## Continuing a terminal Pi session
+
+This needs a Pi Pocket with `registerPiSessionCompanion`. When you continue a terminal Pi session, the extension imports its `<pi-session>.jsonl.acp.json` compression state if at least 90% of the compressed message IDs match the copied context. It keeps compression refs and summaries, translates message IDs, and does not replace an existing conversation's compression state.
+
+Without this API, or when the state does not match, history replay is the fallback: billion-context-pi replays the compress calls in the copied history.
+
 ## Forks
 
 billion-context-pi keeps its compression state in a file for each session. On its own, a fork starts without that state, so the old messages come back at full size.
