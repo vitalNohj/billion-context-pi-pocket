@@ -284,11 +284,100 @@ function restoreCheckpoint(file: string, messages: readonly any[]): string | und
     return undefined;
 }
 
+// ---- terminal Pi imports ----
+
+type PiImportEntry = { from?: string; id: unknown; message: any };
+
+/** Translate terminal Pi entry IDs without changing the compression refs or the source state. */
+export function translatePiState(
+    state: any,
+    entries: readonly PiImportEntry[],
+): { state: any; mapped: number; total: number } | undefined {
+    if (
+        !Array.isArray(state?.blocks) ||
+        state.blocks.length === 0 ||
+        !state.messageRefs?.byRaw ||
+        !state.messageRefs?.byRef
+    ) {
+        return undefined;
+    }
+    const live = branchEntries(entries.map((entry) => entry.message));
+    // Duplicate-message ranks use the whole copied context and can differ if a later request changes that context.
+    const map = new Map<string, string>();
+    entries.forEach((entry, i) => {
+        if (entry.from !== undefined && !map.has(entry.from)) map.set(entry.from, live[i].id);
+    });
+    const ids = new Set<string>(state.blocks.flatMap((block: any) => block.effectiveMessageIds));
+    const mapped = [...ids].filter((id) => map.has(id)).length;
+    const translateIds = (ids: readonly string[]) => ids.flatMap((id) => map.has(id) ? [map.get(id)!] : []);
+    const translated = {
+        ...state,
+        blocks: state.blocks.map((block: any) => ({
+            ...block,
+            effectiveMessageIds: translateIds(block.effectiveMessageIds),
+            directMessageIds: translateIds(block.directMessageIds),
+        })).filter((block: any) => block.effectiveMessageIds.length > 0),
+        messageRefs: {
+            ...state.messageRefs,
+            byRaw: Object.fromEntries(Object.entries(state.messageRefs.byRaw)
+                .filter(([id]) => map.has(id)).map(([id, ref]) => [map.get(id)!, ref])),
+            byRef: Object.fromEntries(Object.entries(state.messageRefs.byRef)
+                .filter(([, id]) => map.has(id as string)).map(([ref, id]) => [ref, map.get(id as string)!])),
+        },
+        ...(state.lastPassIds === undefined ? {} : { lastPassIds: translateIds(state.lastPassIds) }),
+    };
+    return { state: translated, mapped, total: ids.size };
+}
+
+/** Import a matching terminal sidecar atomically; keep any compression the conversation already has. */
+export function importPiState(
+    companion: string,
+    entries: readonly PiImportEntry[],
+    target: string,
+): { blocks: number; mapped: number; total: number } | undefined {
+    if ((readState(target)?.blocks.length ?? 0) > 0) return undefined;
+    let source: any;
+    try {
+        source = JSON.parse(readFileSync(companion, "utf8"));
+    } catch (error: any) {
+        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+        return undefined;
+    }
+    const translated = translatePiState(source, entries);
+    if (translated === undefined || translated.mapped / translated.total < 0.9) return undefined;
+    const restored = {
+        ...deriveChildState!(translated.state),
+        schemaVersion: translated.state.schemaVersion,
+        producer: translated.state.producer,
+        derivedFrom: { piSession: companion.slice(0, -".acp.json".length), derivedAt: Date.now() },
+        liveRefOrigins: [],
+    };
+    const file = `${target}.acp.json`;
+    const temporary = `${file}.pi-import-${process.pid}`;
+    writeFileSync(temporary, JSON.stringify(restored), { mode: 0o600 });
+    renameSync(temporary, file);
+    return { blocks: restored.blocks.length, mapped: translated.mapped, total: translated.total };
+}
+
 // ---- the adapter ----
 
 type Level = "info" | "warning" | "error";
 /** The part of Pi Pocket's host this uses. */
-type Host = { dataDir: string; notice(level: Level, message: string, conversationId?: string): void };
+type Host = {
+    dataDir: string;
+    notice(level: Level, message: string, conversationId?: string): void;
+    registerPiSessionCompanion?(companion: {
+        suffix: string;
+        label: string;
+        continued(input: {
+            conversationId: unknown;
+            piFile: string;
+            companion: string;
+            entries: readonly PiImportEntry[];
+        }): Promise<string | void> | string | void;
+    }): () => void;
+};
+type Web = { onDispose(cleanup: () => void): void };
 type Handler = (event: any, ctx: any) => unknown;
 type PiTool = {
     name: string;
@@ -423,7 +512,7 @@ function json(value: unknown): any {
 }
 
 /** Pi Pocket calls this synchronously: everything asynchronous happens at import or in the hooks. */
-export default function createBillionContextPiPocket(host: Host) {
+export default function createBillionContextPiPocket(host: Host, web?: Web) {
     const stateDir = isAbsolute(settings.stateDir ?? "")
         ? settings.stateDir!
         : join(host.dataDir, settings.stateDir ?? "billion-context-pi");
@@ -689,10 +778,25 @@ export default function createBillionContextPiPocket(host: Host) {
         },
     } as any);
 
-    return defineExtension({
+    const extension = defineExtension({
         name: extensionName,
         tools: durableTools as any,
         sections: [prompt],
         hooks: [generation, toolHooks, compaction],
     });
+    if (typeof host.registerPiSessionCompanion === "function") {
+        const unregister = host.registerPiSessionCompanion({
+            suffix: ".acp.json",
+            label: "Compression state",
+            async continued(input) {
+                const imported = importPiState(input.companion, input.entries, sessionFile(String(input.conversationId)));
+                if (imported !== undefined) return `Imported compression from Pi: ${imported.blocks} blocks.`;
+                if ((readState(input.piFile)?.blocks.length ?? 0) > 0) {
+                    return "Pi's compression state did not match this copy; billion-context-pi replays its compress calls instead.";
+                }
+            },
+        });
+        web?.onDispose(unregister);
+    }
+    return extension;
 }

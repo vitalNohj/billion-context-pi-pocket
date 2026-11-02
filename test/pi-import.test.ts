@@ -1,0 +1,195 @@
+import { testHome } from "./env.ts";
+import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { registerHooks } from "node:module";
+import { join, resolve } from "node:path";
+import { test } from "node:test";
+import { pathToFileURL } from "node:url";
+
+// Import the real adapter and bundled deriveChildState without a Pocket checkout. These host-only exports are
+// unused by the pure import helpers; the terminal session manager is likewise unused in fork-host mode.
+const stubs = new Map([
+    ["@earendil-works/pi-durable", `export const AgentDoc = null, CompactionTask = null, defineExtension = null,
+        defineTool = null, GenerationTask = null, hook = null, section = null, ToolTask = null;`],
+    ["@earendil-works/pi-coding-agent", "export class SessionManager {}"],
+]);
+const loader = registerHooks({
+    resolve(specifier, context, nextResolve) {
+        const source = stubs.get(specifier);
+        return source === undefined
+            ? nextResolve(specifier, context)
+            : { url: `data:text/javascript,${encodeURIComponent(source)}`, shortCircuit: true };
+    },
+});
+let mod: typeof import("../billion-context-pi-pocket.ts");
+try {
+    mod = await import(pathToFileURL(resolve(import.meta.dirname, "../billion-context-pi-pocket.ts")).href);
+} finally {
+    loader.deregister();
+}
+const { branchEntries, importPiState, translatePiState } = mod;
+
+function fixture(count = 10) {
+    const ids = Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(8, "0"));
+    const refs = ids.map((_, i) => `m${String(i + 1).padStart(5, "0")}`);
+    const entries = ids.map((from, i) => ({
+        from,
+        id: i + 1,
+        message: { role: "user", content: [{ type: "text", text: `Message ${i + 1}` }], timestamp: i },
+    }));
+    const block = {
+        blockId: "b1", effectiveMessageIds: [...ids], directMessageIds: [...ids],
+        directBlockIds: [], startRef: refs[0], endRef: refs.at(-1), summary: "Keep this summary.",
+        active: true, generation: 1, compressCallId: "compress-1", originalTokens: 1000, compressedTokens: 10,
+    };
+    const state = {
+        schemaVersion: 1,
+        producer: { name: "billion-context-pi", version: "0.1.83" },
+        blocks: [block],
+        messageRefs: {
+            byRaw: Object.fromEntries(ids.map((id, i) => [id, refs[i]])),
+            byRef: Object.fromEntries(ids.map((id, i) => [refs[i], id])),
+        },
+        lastPassIds: [...ids],
+        tokenSnapshot: Object.fromEntries(refs.map((ref) => [ref, 100])),
+        hiddenOrphanRefs: [], liveRefOrigins: [], rules: [], nextRuleId: 1, nextBlockId: 2, nextRunId: 2,
+    };
+    return { ids, refs, entries, state };
+}
+
+function files(state: any) {
+    const dir = mkdtempSync(join(testHome, "pi-import-"));
+    const companion = join(dir, "terminal.jsonl.acp.json");
+    const target = join(dir, "conversation.jsonl");
+    writeFileSync(companion, JSON.stringify(state));
+    return { dir, companion, target };
+}
+
+test("all Pi IDs map without changing refs, other block fields, or the source", () => {
+    const { state, entries } = fixture();
+    const before = structuredClone(state);
+    const live = branchEntries(entries.map((entry) => entry.message)).map((entry) => entry.id);
+    const result = translatePiState(state, entries)!;
+    assert.equal(result.mapped, 10);
+    assert.equal(result.total, 10);
+    assert.deepEqual(result.state.blocks, [{ ...state.blocks[0], effectiveMessageIds: live, directMessageIds: live }]);
+    assert.deepEqual(result.state.lastPassIds, live);
+    assert.deepEqual(result.state.messageRefs, {
+        byRaw: Object.fromEntries(live.map((id, i) => [id, state.messageRefs.byRaw[entries[i].from]])),
+        byRef: Object.fromEntries(Object.keys(state.messageRefs.byRef).map((ref, i) => [ref, live[i]])),
+    });
+    assert.deepEqual(result.state.tokenSnapshot, state.tokenSnapshot);
+    assert.deepEqual(state, before);
+});
+
+test("missing IDs leave the rest of a block and remove both ref mappings and empty blocks", () => {
+    const { state, entries, ids, refs } = fixture();
+    state.blocks.push({ ...state.blocks[0], blockId: "b2", effectiveMessageIds: [ids[0]], directMessageIds: [ids[0]] });
+    const before = structuredClone(state);
+    const kept = entries.slice(1);
+    const live = branchEntries(kept.map((entry) => entry.message)).map((entry) => entry.id);
+    const result = translatePiState(state, kept)!;
+    assert.equal(result.total, 10, "IDs shared by blocks count only once");
+    assert.equal(result.mapped, 9);
+    assert.deepEqual(result.state.blocks, [{ ...state.blocks[0], effectiveMessageIds: live, directMessageIds: live }]);
+    assert.equal(Object.keys(result.state.messageRefs.byRaw).length, 9);
+    assert.equal(Object.keys(result.state.messageRefs.byRef).length, 9);
+    assert.equal(ids[0] in result.state.messageRefs.byRaw, false);
+    assert.equal(refs[0] in result.state.messageRefs.byRef, false);
+    assert.deepEqual(result.state.lastPassIds, live);
+    assert.deepEqual(result.state.tokenSnapshot, state.tokenSnapshot, "ref-keyed snapshots stay unchanged");
+    assert.deepEqual(state, before);
+});
+
+test("live ranks include Pocket-made messages and only the first item from each Pi entry maps", () => {
+    const { state } = fixture(1);
+    const message = { role: "user", content: "duplicate" };
+    const entries = [
+        { id: 1, message },
+        { from: "00000001", id: 2, message },
+        { from: "00000001", id: 3, message },
+    ];
+    const live = branchEntries(entries.map((entry) => entry.message));
+    const result = translatePiState(state, entries)!;
+    assert.deepEqual(result.state.blocks[0].effectiveMessageIds, [live[1].id]);
+    assert.equal(result.state.messageRefs.byRaw[live[1].id], "m00001");
+    assert.equal(result.total, 1);
+    assert.equal(result.mapped, 1);
+});
+
+test("translation declines absent, empty, or incomplete compression state", () => {
+    const { state, entries } = fixture();
+    for (const invalid of [undefined, null, {}, { blocks: {} }, { ...state, blocks: [] },
+        { ...state, messageRefs: undefined }, { ...state, messageRefs: { byRaw: {} } },
+        { ...state, messageRefs: { byRef: {} } }]) {
+        assert.equal(translatePiState(invalid, entries), undefined);
+    }
+});
+
+test("a matching import writes derived state atomically and retains the terminal sidecar", () => {
+    const { state, entries } = fixture();
+    const { dir, companion, target } = files(state);
+    const original = readFileSync(companion, "utf8");
+    const before = Date.now();
+    assert.deepEqual(importPiState(companion, entries, target), { blocks: 1, mapped: 10, total: 10 });
+    const imported = JSON.parse(readFileSync(`${target}.acp.json`, "utf8"));
+    const translated = translatePiState(state, entries)!.state;
+    assert.deepEqual(imported.blocks, translated.blocks);
+    assert.deepEqual(imported.messageRefs, translated.messageRefs);
+    assert.deepEqual(imported.tokenSnapshot, state.tokenSnapshot);
+    assert.equal(imported.schemaVersion, state.schemaVersion);
+    assert.deepEqual(imported.producer, state.producer);
+    assert.equal(imported.derivedFrom.piSession, companion.slice(0, -".acp.json".length));
+    assert.ok(imported.derivedFrom.derivedAt >= before && imported.derivedFrom.derivedAt <= Date.now());
+    assert.deepEqual(imported.liveRefOrigins, []);
+    assert.equal(statSync(`${target}.acp.json`).mode & 0o777, 0o600);
+    assert.equal(readFileSync(companion, "utf8"), original);
+    assert.deepEqual(readdirSync(dir).sort(), ["conversation.jsonl.acp.json", "terminal.jsonl.acp.json"]);
+});
+
+test("exactly 90 percent mapping is accepted", () => {
+    const { state, entries } = fixture();
+    const { companion, target } = files(state);
+    assert.deepEqual(importPiState(companion, entries.slice(1), target), { blocks: 1, mapped: 9, total: 10 });
+});
+
+test("below 90 percent mapping writes nothing", () => {
+    const { state, entries } = fixture();
+    const { dir, companion, target } = files(state);
+    assert.equal(importPiState(companion, entries.slice(2), target), undefined);
+    assert.equal(existsSync(`${target}.acp.json`), false);
+    assert.deepEqual(readdirSync(dir), ["terminal.jsonl.acp.json"]);
+    const previous = '{"blocks":[],"untouched":true}\n';
+    writeFileSync(`${target}.acp.json`, previous);
+    assert.equal(importPiState(companion, entries.slice(2), target), undefined);
+    assert.equal(readFileSync(`${target}.acp.json`, "utf8"), previous);
+});
+
+test("an existing target with blocks is not overwritten", () => {
+    const { state, entries } = fixture();
+    const { dir, companion, target } = files(state);
+    const previous = '{"blocks":[{"blockId":"existing"}],"untouched":true}\n';
+    writeFileSync(`${target}.acp.json`, previous);
+    assert.equal(importPiState(companion, entries, target), undefined);
+    assert.equal(readFileSync(`${target}.acp.json`, "utf8"), previous);
+    assert.deepEqual(readdirSync(dir).sort(), ["conversation.jsonl.acp.json", "terminal.jsonl.acp.json"]);
+});
+
+test("missing, invalid JSON, or empty companion state writes nothing", () => {
+    const { state, entries } = fixture();
+    const { dir, companion, target } = files(state);
+    assert.equal(importPiState(join(dir, "missing.acp.json"), entries, target), undefined);
+    for (const value of ["{invalid", "null", "{}", '{"blocks":[]}', JSON.stringify({ blocks: state.blocks })]) {
+        writeFileSync(companion, value);
+        assert.equal(importPiState(companion, entries, target), undefined);
+        assert.equal(existsSync(`${target}.acp.json`), false);
+    }
+    assert.deepEqual(readdirSync(dir), ["terminal.jsonl.acp.json"]);
+});
+
+test("import errors other than a missing file or JSON syntax propagate", () => {
+    const { state, entries } = fixture();
+    const { dir, target } = files(state);
+    assert.throws(() => importPiState(dir, entries, target), { code: "EISDIR" });
+    assert.equal(existsSync(`${target}.acp.json`), false);
+});
