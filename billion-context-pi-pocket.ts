@@ -307,9 +307,19 @@ export function translatePiState(
     entries.forEach((entry, i) => {
         if (entry.from !== undefined && !map.has(entry.from)) map.set(entry.from, live[i].id);
     });
+    const translateId = (id: string): string | undefined => {
+        // Multi-tool-call messages use <entry>#<tool-call>; only the entry part changes between hosts.
+        const hash = id.indexOf("#");
+        const base = hash === -1 ? id : id.slice(0, hash);
+        const liveId = map.get(base);
+        return liveId === undefined ? undefined : liveId + (hash === -1 ? "" : id.slice(hash));
+    };
     const ids = new Set<string>(state.blocks.flatMap((block: any) => block.effectiveMessageIds));
-    const mapped = [...ids].filter((id) => map.has(id)).length;
-    const translateIds = (ids: readonly string[]) => ids.flatMap((id) => map.has(id) ? [map.get(id)!] : []);
+    const mapped = [...ids].filter((id) => translateId(id) !== undefined).length;
+    const translateIds = (ids: readonly string[]) => ids.flatMap((id) => {
+        const translated = translateId(id);
+        return translated === undefined ? [] : [translated];
+    });
     const translated = {
         ...state,
         blocks: state.blocks.map((block: any) => ({
@@ -319,10 +329,14 @@ export function translatePiState(
         })).filter((block: any) => block.effectiveMessageIds.length > 0),
         messageRefs: {
             ...state.messageRefs,
-            byRaw: Object.fromEntries(Object.entries(state.messageRefs.byRaw)
-                .filter(([id]) => map.has(id)).map(([id, ref]) => [map.get(id)!, ref])),
-            byRef: Object.fromEntries(Object.entries(state.messageRefs.byRef)
-                .filter(([, id]) => map.has(id as string)).map(([ref, id]) => [ref, map.get(id as string)!])),
+            byRaw: Object.fromEntries(Object.entries(state.messageRefs.byRaw).flatMap(([id, ref]) => {
+                const translated = translateId(id);
+                return translated === undefined ? [] : [[translated, ref]];
+            })),
+            byRef: Object.fromEntries(Object.entries(state.messageRefs.byRef).flatMap(([ref, id]) => {
+                const translated = translateId(id as string);
+                return translated === undefined ? [] : [[ref, translated]];
+            })),
         },
         ...(state.lastPassIds === undefined ? {} : { lastPassIds: translateIds(state.lastPassIds) }),
     };
@@ -344,7 +358,7 @@ export function importPiState(
         return undefined;
     }
     const translated = translatePiState(source, entries);
-    if (translated === undefined || translated.mapped / translated.total < 0.9) return undefined;
+    if (translated === undefined || translated.total === 0 || translated.mapped / translated.total < 0.9) return undefined;
     const restored = {
         ...deriveChildState!(translated.state),
         schemaVersion: translated.state.schemaVersion,

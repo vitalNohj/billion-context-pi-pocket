@@ -101,6 +101,51 @@ test("missing IDs leave the rest of a block and remove both ref mappings and emp
     assert.deepEqual(state, before);
 });
 
+test("composite IDs translate only their base in every field and coverage counts distinct full IDs", () => {
+    const { state, entries, ids } = fixture(2);
+    const fullIds = [ids[0], `${ids[0]}#toolu_X`, `${ids[0]}#toolu_Y#suffix`, `${ids[1]}#toolu_Z`];
+    const refs = fullIds.map((_, i) => `m${String(i + 1).padStart(5, "0")}`);
+    state.blocks[0] = { ...state.blocks[0], effectiveMessageIds: fullIds, directMessageIds: fullIds, endRef: refs.at(-1) };
+    state.blocks.push({ ...state.blocks[0], blockId: "b2", effectiveMessageIds: [fullIds[1]], directMessageIds: [fullIds[1]] });
+    state.messageRefs = {
+        byRaw: Object.fromEntries(fullIds.map((id, i) => [id, refs[i]])),
+        byRef: Object.fromEntries(fullIds.map((id, i) => [refs[i], id])),
+    };
+    state.lastPassIds = [...fullIds];
+    state.tokenSnapshot = Object.fromEntries(refs.map((ref) => [ref, 100]));
+    const before = structuredClone(state);
+    const live = branchEntries(entries.map((entry) => entry.message));
+    const expected = [live[0].id, `${live[0].id}#toolu_X`, `${live[0].id}#toolu_Y#suffix`, `${live[1].id}#toolu_Z`];
+    const result = translatePiState(state, entries)!;
+    assert.equal(result.mapped, 4);
+    assert.equal(result.total, 4, "full IDs stay distinct, even when bases repeat or blocks share IDs");
+    assert.deepEqual(result.state.blocks, [
+        { ...state.blocks[0], effectiveMessageIds: expected, directMessageIds: expected },
+        { ...state.blocks[1], effectiveMessageIds: [expected[1]], directMessageIds: [expected[1]] },
+    ]);
+    assert.deepEqual(result.state.messageRefs, {
+        byRaw: Object.fromEntries(expected.map((id, i) => [id, refs[i]])),
+        byRef: Object.fromEntries(expected.map((id, i) => [refs[i], id])),
+    });
+    assert.deepEqual(result.state.lastPassIds, expected);
+    assert.deepEqual(result.state.tokenSnapshot, state.tokenSnapshot);
+    assert.deepEqual(state, before);
+    const { companion, target } = files(state);
+    assert.deepEqual(importPiState(companion, entries, target), { blocks: 2, mapped: 4, total: 4 });
+    const imported = JSON.parse(readFileSync(`${target}.acp.json`, "utf8"));
+    assert.deepEqual(imported.blocks, result.state.blocks);
+    assert.deepEqual(imported.messageRefs, result.state.messageRefs);
+
+    const missing = translatePiState(state, entries.slice(0, 1))!;
+    assert.equal(missing.mapped, 3);
+    assert.equal(missing.total, 4);
+    assert.deepEqual(missing.state.blocks[0].effectiveMessageIds, expected.slice(0, 3));
+    assert.deepEqual(missing.state.blocks[0].directMessageIds, expected.slice(0, 3));
+    assert.deepEqual(missing.state.lastPassIds, expected.slice(0, 3));
+    assert.equal(fullIds[3] in missing.state.messageRefs.byRaw, false);
+    assert.equal(refs[3] in missing.state.messageRefs.byRef, false);
+});
+
 test("live ranks include Pocket-made messages and only the first item from each Pi entry maps", () => {
     const { state } = fixture(1);
     const message = { role: "user", content: "duplicate" };
@@ -162,6 +207,22 @@ test("below 90 percent mapping writes nothing", () => {
     const previous = '{"blocks":[],"untouched":true}\n';
     writeFileSync(`${target}.acp.json`, previous);
     assert.equal(importPiState(companion, entries.slice(2), target), undefined);
+    assert.equal(readFileSync(`${target}.acp.json`, "utf8"), previous);
+});
+
+test("a state with blocks but no effective IDs writes nothing", () => {
+    const { state } = fixture();
+    state.blocks[0] = { ...state.blocks[0], effectiveMessageIds: [], directMessageIds: [] };
+    state.messageRefs = { byRaw: {}, byRef: {} };
+    state.lastPassIds = [];
+    const { dir, companion, target } = files(state);
+    assert.equal(translatePiState(state, [])!.total, 0);
+    assert.equal(importPiState(companion, [], target), undefined);
+    assert.equal(existsSync(`${target}.acp.json`), false);
+    assert.deepEqual(readdirSync(dir), ["terminal.jsonl.acp.json"]);
+    const previous = '{"blocks":[],"untouched":true}\n';
+    writeFileSync(`${target}.acp.json`, previous);
+    assert.equal(importPiState(companion, [], target), undefined);
     assert.equal(readFileSync(`${target}.acp.json`, "utf8"), previous);
 });
 
