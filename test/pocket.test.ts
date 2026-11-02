@@ -60,6 +60,10 @@ if (skip === false) {
         const { role, text } = lastText(request);
         const call = (name: string, args: any) =>
             fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
+        const batchDecompression = /decompress-batch:(\[[^\n]*\])/.exec(text);
+        if (role === "user" && batchDecompression) {
+            return call("codemode", { code: `const results = await Promise.all(${batchDecompression[1]}.map(args => tools.decompress(args))); for (const result of results) text(result);` });
+        }
         const requestedDecompression = /decompress-json:(\{[^\n]*\})/.exec(text);
         if (role === "user" && requestedDecompression) {
             return call("decompress", JSON.parse(requestedDecompression[1]));
@@ -489,6 +493,30 @@ for (const verdict of ["allow", "block", "approve", "deny"]) {
     });
 }
 
+test("decompress exports in one codemode script have independent guarded writes", { skip }, async () => {
+    const { context, newSession, say } = h;
+    const id = await newSession(app);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const destinations = [join(testHome, "batch-decompression-a.txt"), join(testHome, "batch-decompression-b.txt")];
+    const judge = app.guard.judge;
+    const judged: string[] = [];
+    app.guard.judge = async (name: string, args: any) => {
+        if (name === "write") judged.push(args.path);
+        return undefined;
+    };
+    try {
+        const before = requestCount;
+        await say(app, id, `decompress-batch:${JSON.stringify(destinations.map((toFile) => ({ blockId: "b1", toFile })))}`);
+        const history = (await (await app.harness.conversation(id, context)).context(context)).messages;
+        const result = history.findLast((message: any) => message.role === "toolResult" && message.toolName === "codemode");
+        assert.notEqual(result.isError, true, textOf([result]));
+        assert.deepEqual(judged.sort(), destinations.slice().sort());
+        for (const path of destinations) assert.match(readFileSync(path, "utf8"), /OLD_LOG_A/);
+        assert.equal(requestCount - before, 2, "batching does not add a model turn");
+    } finally { app.guard.judge = judge; }
+});
+
 test("decompress file capability is honestly blocked in plan mode without changing compression", { skip }, async () => {
     const { context, newSession, say, owner } = h;
     const id = await newSession(app);
@@ -588,7 +616,7 @@ for (const outcome of ["success", "blocked", "throws", "upstream-error", "missin
                 assert.equal(name, "write");
                 assert.equal(args.path, destination);
                 assert.equal(args.content, "EXACT_RESTORED_CONTENT");
-                assert.equal(options.key, "decompressed-file");
+                assert.match(options.key, /^decompressed-file-[a-f0-9]{64}$/);
                 assert.equal(readFileSync(destination, "utf8"), "ORIGINAL", "BCP never receives or writes the requested destination");
                 if (outcome === "throws") throw new Error("NESTED_WRITE_ABORTED");
                 if (outcome === "blocked") return { isError: true, diagnostics: [{ message: "GUARD_DENIED" }] };

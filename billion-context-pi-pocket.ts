@@ -388,8 +388,11 @@ export async function decompressToFile(
             if (error.code === "ENOENT") return result;
             throw error;
         }
+        // Pocket's codemode can forward one parent's executeTool API to several calls. Include this call's ID so
+        // exports in the same script never reuse a durable nested-call key with different paths or content.
+        const key = `decompressed-file-${createHash("sha256").update(toolApi.callId).digest("hex")}`;
         const written = await toolApi.executeTool(
-            "write", { path: destination, content }, context, { key: "decompressed-file" },
+            "write", { path: destination, content }, context, { key },
         );
         if (written.isError) {
             const reason = written.diagnostics?.map((item: any) => item.message).filter(Boolean).join("\n")
