@@ -13,7 +13,7 @@ const ownPackage = await json(join(root, "package.json"));
 const packageDir = join(root, "node_modules/billion-context-pi");
 const pkg = await json(join(packageDir, "package.json"));
 if (pkg.name !== "billion-context-pi" || pkg.version !== upstream.version || ownPackage.version !== upstream.version) {
-    throw new Error("Adapter, upstream metadata, and installed BCP versions must agree");
+    throw new Error("Extension, upstream metadata, and installed BCP versions must agree");
 }
 if (lock.packages["node_modules/billion-context-pi"]?.integrity !== upstream.npmIntegrity) {
     throw new Error("Installed BCP does not match the pinned npm release integrity");
@@ -35,7 +35,7 @@ for (const path of ["package.json", "LICENSE", ...await filesUnder(join(packageD
     files.set(`${runtimeDirectory}/${path}`, await readFile(join(packageDir, path)));
 }
 let notices = `THIRD-PARTY NOTICES — billion-context-pi ${upstream.version}\n\n` +
-    "This adapter uses billion-context-pi and acp-kernel by ranxianglei.\n" +
+    "This extension uses billion-context-pi and acp-kernel by ranxianglei.\n" +
     "https://github.com/ranxianglei/billion-context-pi\n" +
     "https://github.com/ranxianglei/acp-kernel\n" +
     "https://github.com/ranxianglei/billion-context\n\n" +

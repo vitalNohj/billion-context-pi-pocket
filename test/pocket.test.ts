@@ -4,14 +4,16 @@
  */
 import { testHome } from "./env.ts";
 import assert from "node:assert/strict";
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 
 const repo = resolve(import.meta.dirname, "..");
-const ADAPTER = "billion-context-pi-pocket-adapter.ts";
-const BUNDLE = "billion-context-pi-pocket-adapter";
+const ADAPTER = "billion-context-pi-pocket.ts";
+const BUNDLE = "billion-context-pi-pocket";
+const SETTINGS = "billion-context-pi-pocket.json";
+const LEGACY_SETTINGS = "billion-context-pi-pocket-adapter.json";
 const pocketDir = process.env.PI_POCKET_CHECKOUT;
 const skip =
     pocketDir === undefined
@@ -27,14 +29,15 @@ let dataDir = "";
 let dropin = "";
 let lastRequest: readonly any[] = [];
 let mod: any;
+let model: any;
 const CHECKPOINT_KEY = "pocketBcpCheckpoint";
 
 /** A drop-in folder with the adapter, its settings, and Pi Pocket's packages, as Pi Pocket makes it. */
-function dropInFolder(folder: string, settings: Record<string, string> = {}, includeBundle = true): string {
+function dropInFolder(folder: string, settings: Record<string, string> = {}, includeBundle = true, settingsFile = SETTINGS): string {
     mkdirSync(folder, { recursive: true });
     copyFileSync(join(repo, ADAPTER), join(folder, ADAPTER));
     if (includeBundle) cpSync(join(repo, BUNDLE), join(folder, BUNDLE), { recursive: true });
-    writeFileSync(join(folder, "billion-context-pi-pocket-adapter.json"), JSON.stringify(settings));
+    writeFileSync(join(folder, settingsFile), JSON.stringify(settings));
     return join(folder, ADAPTER);
 }
 
@@ -49,7 +52,7 @@ if (skip === false) {
     writeFileSync(join(work, "A.log"), "OLD_LOG_A: original diagnostics\n".repeat(200));
     writeFileSync(join(work, "B.log"), "OLD_LOG_B: later diagnostics\n".repeat(200));
 
-    const model = scriptedModel((request: any) => {
+    model = scriptedModel((request: any) => {
         lastRequest = request.messages;
         const { role, text } = lastText(request);
         const call = (name: string, args: any) =>
@@ -286,7 +289,7 @@ test("a missing bundle says to copy the helper folder, without a separate pi ins
     const folder = mkdtempSync(join(testHome, "missing-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
     const file = dropInFolder(folder, {}, false);
-    await assert.rejects(import(pathToFileURL(file).href), /Copy the billion-context-pi-pocket-adapter\/ folder/);
+    await assert.rejects(import(pathToFileURL(file).href), /Copy the billion-context-pi-pocket\/ folder/);
 });
 
 test("legacy package paths cannot override the pinned bundle", { skip }, async () => {
@@ -330,4 +333,82 @@ test("decompression keeps both automatic and custom file output", { skip }, asyn
     const result = messages.messages.findLast((m: any) => m.role === "toolResult" && m.toolName === "decompress");
     assert.notEqual(result.isError, true);
     assert.match(readFileSync(join(testHome, "custom-decompression.txt"), "utf8"), /OLD_LOG_A/);
+});
+
+test("the old settings filename keeps its stored identity and state folder", { skip }, async () => {
+    const folder = mkdtempSync(join(testHome, "legacy-settings-"));
+    symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
+    const file = dropInFolder(folder, { stateDir: "bcp", extensionName: "bcp-adapter" }, true, LEGACY_SETTINGS);
+    mkdirSync(join(folder, "bcp"));
+    const sentinel = join(folder, "bcp", "existing.jsonl.acp.json");
+    const contents = '{"blocks":[{"blockId":"b1","summary":"existing compressed history"}]}';
+    writeFileSync(sentinel, contents);
+    const configured = await import(pathToFileURL(file).href);
+    assert.equal(configured.default({ dataDir: folder, notice() {} }).name, "bcp-adapter");
+    assert.equal(readFileSync(sentinel, "utf8"), contents, "loading does not rewrite existing state");
+    assert.equal(existsSync(join(folder, SETTINGS)), false, "loading does not mutate settings");
+});
+
+test("the new settings file takes precedence over an invalid legacy file", { skip }, async () => {
+    const folder = mkdtempSync(join(testHome, "new-settings-"));
+    symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
+    const file = dropInFolder(folder, { stateDir: "current-state", extensionName: "current-extension" });
+    writeFileSync(join(folder, LEGACY_SETTINGS), "not valid JSON");
+    const configured = await import(pathToFileURL(file).href);
+    assert.equal(configured.default({ dataDir: folder, notice() {} }).name, "current-extension");
+    assert.ok(existsSync(join(folder, "current-state")));
+});
+
+test("an invalid new settings file cannot silently use legacy settings", { skip }, async () => {
+    const folder = mkdtempSync(join(testHome, "invalid-settings-"));
+    symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
+    const file = dropInFolder(folder, { stateDir: "bcp", extensionName: "bcp-adapter" }, true, LEGACY_SETTINGS);
+    writeFileSync(join(folder, SETTINGS), "[]");
+    await assert.rejects(import(pathToFileURL(file).href), /billion-context-pi-pocket\.json must hold a JSON object/);
+});
+
+test("renaming a loaded module and settings keeps compressed sessions, forks, and restart recovery", { skip }, async () => {
+    const migrationData = join(h.root, "data-bcp-rename");
+    const folder = join(migrationData, "extensions");
+    const current = dropInFolder(folder, { stateDir: "bcp", extensionName: "bcp-adapter" }, true, LEGACY_SETTINGS);
+    const legacyName = "billion-context-pi-pocket-adapter.ts";
+    const legacy = join(folder, legacyName);
+    renameSync(current, legacy);
+    let migrating = await h.openApp(model, migrationData);
+    const stored = (id: unknown) => join(migrationData, "bcp", `${id}.jsonl.acp.json`);
+    try {
+        await migrating.setExtensionEnabled(h.owner(migrating), legacyName, true);
+        const id = await h.newSession(migrating);
+        await h.say(migrating, id, "read A");
+        await h.say(migrating, id, "fold A");
+        const parent = (await migrating.harness.conversation(id, h.context))!;
+        const forkPoint = await tail(parent);
+        const before = readFileSync(stored(id), "utf8");
+        assert.equal(JSON.parse(before).blocks.length, 1);
+        await migrating.setExtensionEnabled(h.owner(migrating), legacyName, false);
+        renameSync(legacy, current);
+        renameSync(join(folder, LEGACY_SETTINGS), join(folder, SETTINGS));
+        await migrating.setExtensionEnabled(h.owner(migrating), ADAPTER, true);
+        assert.equal(readFileSync(stored(id), "utf8"), before, "the rename does not rewrite compression state");
+        await h.say(migrating, id, "continue");
+        assert.match(textOf(lastRequest), /SUMMARY_A/);
+        assert.doesNotMatch(textOf(lastRequest), /OLD_LOG_A/);
+        const fork = await continueFork(parent, forkPoint);
+        assert.equal(JSON.parse(readFileSync(stored(fork.id), "utf8")).blocks.length, 1);
+        assert.match(textOf(lastRequest), /SUMMARY_A/);
+        await migrating.close();
+        migrating = await h.openApp(model, migrationData);
+        await h.say(migrating, id, "unfold");
+        const restarted = (await migrating.harness.conversation(id, h.context))!;
+        const result = (await restarted.context(h.context)).messages.findLast(
+            (entry: any) => entry.role === "toolResult" && entry.toolName === "decompress",
+        );
+        assert.ok(result);
+        assert.notEqual(result.isError, true);
+        assert.match(textOf([result]), /OLD_LOG_A/);
+        assert.equal(existsSync(legacy), false);
+        assert.equal(existsSync(join(folder, LEGACY_SETTINGS)), false);
+    } finally {
+        await migrating.close();
+    }
 });

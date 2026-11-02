@@ -53,7 +53,7 @@ jobs:
         with:
           node-version: 24
 
-      - name: Check out Pi Pocket outside the adapter repository
+      - name: Check out Pi Pocket outside the extension repository
         shell: bash
         run: |
           set -euo pipefail
@@ -200,7 +200,7 @@ jobs:
           git apply --check --index "$PATCH_FILE"
           git apply --index "$PATCH_FILE"
           # Keep copied upstream files byte-for-byte, even if their whitespace changes.
-          git diff --cached --check -- package.json package-lock.json upstream.json billion-context-pi-pocket-adapter.ts
+          git diff --cached --check -- package.json package-lock.json upstream.json billion-context-pi-pocket.ts
           if git diff --cached --quiet; then
             echo "The tested patch contains no changes." >&2
             exit 1
@@ -218,9 +218,9 @@ jobs:
           if (fields.at(-1) === "") fields.pop();
           if (fields.length === 0 || fields.length % 2 !== 0) throw new Error("Invalid staged diff records");
           const fixedPaths = new Set([
-            "package.json", "package-lock.json", "upstream.json", "billion-context-pi-pocket-adapter.ts",
+            "package.json", "package-lock.json", "upstream.json", "billion-context-pi-pocket.ts",
           ]);
-          const vendorPrefix = "billion-context-pi-pocket-adapter/";
+          const vendorPrefix = "billion-context-pi-pocket/";
           const vendorRootFiles = new Set(["bundle.json", "THIRD-PARTY-NOTICES.txt"]);
           const distExtensions = [".js", ".map", ".d.ts", ".json", ".txt"];
           for (let i = 0; i < fields.length; i += 2) {
@@ -325,8 +325,8 @@ jobs:
             }
           }
 
-          const beforeAdapter = execFileSync("git", ["show", "HEAD:billion-context-pi-pocket-adapter.ts"], { encoding: "utf8" });
-          const afterAdapter = readFileSync("billion-context-pi-pocket-adapter.ts", "utf8");
+          const beforeAdapter = execFileSync("git", ["show", "HEAD:billion-context-pi-pocket.ts"], { encoding: "utf8" });
+          const afterAdapter = readFileSync("billion-context-pi-pocket.ts", "utf8");
           const declarationPrefix = "const TESTED_BCP_VERSIONS = ";
           const newline = String.fromCharCode(10);
           const carriageReturn = String.fromCharCode(13);
@@ -337,14 +337,14 @@ jobs:
           const afterDeclarations = declarationLines(afterAdapter);
           const expectedDeclaration = `${declarationPrefix}${JSON.stringify([process.env.UPSTREAM_VERSION])};`;
           if (beforeDeclarations.length !== 1 || afterDeclarations.length !== 1 || afterDeclarations[0] !== expectedDeclaration) {
-            throw new Error("Adapter must contain exactly the tested TESTED_BCP_VERSIONS declaration");
+            throw new Error("Extension must contain exactly the tested TESTED_BCP_VERSIONS declaration");
           }
           const normalizeAdapter = (text) => text.split(newline).map((line) => {
             const content = line.endsWith(carriageReturn) ? line.slice(0, -1) : line;
             return content.startsWith(declarationPrefix) ? `${declarationPrefix}<tested-versions>;` : line;
           }).join(newline);
           if (normalizeAdapter(beforeAdapter) !== normalizeAdapter(afterAdapter)) {
-            throw new Error("Refresh changed adapter code outside TESTED_BCP_VERSIONS");
+            throw new Error("Refresh changed extension code outside TESTED_BCP_VERSIONS");
           }
           NODE
 

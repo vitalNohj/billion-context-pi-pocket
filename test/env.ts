@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export const testHome = mkdtempSync(join(tmpdir(), "bcp-pocket-adapter-test-"));
+export const testHome = mkdtempSync(join(tmpdir(), "bcp-pocket-test-"));
 process.on("exit", () => rmSync(testHome, { recursive: true, force: true }));
 mkdirSync(join(testHome, ".pi"), { recursive: true });
 writeFileSync(

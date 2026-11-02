@@ -75,7 +75,7 @@ await writeFile(join(root, "upstream.json"), JSON.stringify({
     extraLicenses,
 }, null, 2) + "\n");
 
-const adapter = join(root, "billion-context-pi-pocket-adapter.ts");
+const adapter = join(root, "billion-context-pi-pocket.ts");
 const code = await readFile(adapter, "utf8");
 const pattern = /const TESTED_BCP_VERSIONS = \[[^\]\n]*\];/g;
 if ([...code.matchAll(pattern)].length !== 1) throw new Error("Cannot find the one TESTED_BCP_VERSIONS declaration");

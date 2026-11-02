@@ -1,6 +1,6 @@
 THIRD-PARTY NOTICES — billion-context-pi 0.1.83
 
-This adapter uses billion-context-pi and acp-kernel by ranxianglei.
+This extension uses billion-context-pi and acp-kernel by ranxianglei.
 https://github.com/ranxianglei/billion-context-pi
 https://github.com/ranxianglei/acp-kernel
 https://github.com/ranxianglei/billion-context

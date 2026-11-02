@@ -1,5 +1,5 @@
 {
-  "name": "billion-context-pi-pocket-adapter",
+  "name": "billion-context-pi-pocket",
   "version": "0.1.83",
   "private": true,
   "description": "Run billion-context-pi in Pi Pocket, with compression that survives forks.",

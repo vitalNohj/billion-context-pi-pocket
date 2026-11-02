@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
-export const bundleName = "billion-context-pi-pocket-adapter";
+export const bundleName = "billion-context-pi-pocket";
 export const sha256 = (content) => createHash("sha256").update(content).digest("hex");
 export const licenseFile = (name) => /^(?:licen[cs]e|copying|notice)(?:\.[a-z0-9_-]+)?$/i.test(name);
 

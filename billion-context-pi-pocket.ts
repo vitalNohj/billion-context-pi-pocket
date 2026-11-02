@@ -23,7 +23,7 @@
  * history it inherited, so it starts with exactly the compression made before its fork point. Histories without
  * checkpoints fall back to billion-context-pi's own replay of the compress calls they contain.
  *
- * Settings: `billion-context-pi-pocket-adapter.json` next to this file, all optional (see the README).
+ * Settings: `billion-context-pi-pocket.json` next to this file, all optional (see the README).
  */
 import { createHash } from "node:crypto";
 import {
@@ -48,7 +48,9 @@ import {
 
 // ---- settings ----
 
-const SETTINGS_FILE = "billion-context-pi-pocket-adapter.json";
+const SETTINGS_FILE = "billion-context-pi-pocket.json";
+/** Read old installations without changing their stored extension name or compression state. */
+const LEGACY_SETTINGS_FILE = "billion-context-pi-pocket-adapter.json";
 /** Updated with the pinned bundle; a refresh is committed only after the tests pass. */
 const TESTED_BCP_VERSIONS = ["0.1.83"];
 /** In tool-result details. Histories made by earlier versions of this adapter carry it: keep it. */
@@ -64,7 +66,9 @@ interface Settings {
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
-const settingsPath = join(here, SETTINGS_FILE);
+const settingsPath = [SETTINGS_FILE, LEGACY_SETTINGS_FILE]
+    .map((name) => join(here, name))
+    .find((path) => existsSync(path)) ?? join(here, SETTINGS_FILE);
 
 function readSettings(): Settings {
     if (!existsSync(settingsPath)) return {};
@@ -85,12 +89,12 @@ const extensionName = settings.extensionName ?? "billion-context-pi";
 
 // ---- billion-context-pi ----
 
-const bundleDir = join(here, "billion-context-pi-pocket-adapter");
+const bundleDir = join(here, "billion-context-pi-pocket");
 const bundlePath = join(bundleDir, "bundle.json");
 function missingBundle(): never {
     throw new Error(
         `The bundled billion-context-pi is missing at ${bundleDir}. Copy the ` +
-            `billion-context-pi-pocket-adapter/ folder together with this adapter. No separate pi install is needed.`,
+            `billion-context-pi-pocket/ folder together with this extension. No separate pi install is needed.`,
     );
 }
 if (!existsSync(bundlePath)) missingBundle();
@@ -109,7 +113,7 @@ if (bcpPackage.name !== "billion-context-pi" || bcpPackage.version !== BCP_VERSI
     throw new Error(`Bundled package metadata does not match billion-context-pi ${BCP_VERSION}`);
 }
 if (settings.billionContextPi !== undefined) {
-    console.warn(`[bcp-adapter] The legacy billionContextPi setting is ignored; using bundled billion-context-pi ${BCP_VERSION}.`);
+    console.warn(`[billion-context-pi-pocket] The legacy billionContextPi setting is ignored; using bundled billion-context-pi ${BCP_VERSION}.`);
 }
 
 // These are process-wide, as in earlier adapters. Set them before importing BCP.
@@ -122,7 +126,7 @@ const bcp = await import(pathToFileURL(join(bcpDir, "dist", "index.js")).href);
 const factory = bcp.default as (pi: unknown) => unknown;
 const deriveChildState = bcp.deriveChildState as ((state: any) => any) | undefined;
 if (typeof factory !== "function" || typeof deriveChildState !== "function") {
-    throw new Error(`billion-context-pi ${BCP_VERSION} at ${bcpDir} lacks the API this adapter needs`);
+    throw new Error(`billion-context-pi ${BCP_VERSION} at ${bcpDir} lacks the API this extension needs`);
 }
 
 // ---- fork checkpoints ----
@@ -314,7 +318,7 @@ function json(value: unknown): any {
 }
 
 /** Pi Pocket calls this synchronously: everything asynchronous happens at import or in the hooks. */
-export default function createBillionContextPiAdapter(host: Host) {
+export default function createBillionContextPiPocket(host: Host) {
     const stateDir = isAbsolute(settings.stateDir ?? "")
         ? settings.stateDir!
         : join(host.dataDir, settings.stateDir ?? "billion-context-pi");
@@ -322,7 +326,7 @@ export default function createBillionContextPiAdapter(host: Host) {
     if (!TESTED_BCP_VERSIONS.includes(BCP_VERSION)) {
         host.notice(
             "warning",
-            `${extensionName}: billion-context-pi ${BCP_VERSION} is untested with this adapter (tested: ${TESTED_BCP_VERSIONS.join(", ")}).`,
+            `${extensionName}: billion-context-pi ${BCP_VERSION} is untested with this extension (tested: ${TESTED_BCP_VERSIONS.join(", ")}).`,
         );
     }
 
