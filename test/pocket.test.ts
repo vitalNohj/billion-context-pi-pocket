@@ -714,3 +714,70 @@ test("decompress works through a disposable HTTP Pocket server with normal appro
         await new Promise<void>((done) => server.close(() => done()));
     }
 });
+
+test("a terminal Pi session's compression comes along when it continues in Pocket", { skip }, async () => {
+    const { context, newSession, say, owner, work } = h;
+    if (typeof app.piSessions?.registerCompanion !== "function") return;
+    // Compression made here, then written out as Pi in the terminal keeps it: Pi's entry ids, and the state beside the file.
+    const id = await newSession(app);
+    const source = (await app.harness.conversation(id, context))!;
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const messages = (await source.context(context)).messages.flatMap((m: any) => {
+        if (m.role === "system") return [];
+        if (m.role !== "toolResult" || !m.details?.[CHECKPOINT_KEY]) return [m];
+        const { [CHECKPOINT_KEY]: _checkpoint, ...details } = m.details;
+        return [{ ...m, details }];
+    });
+    const live = mod.branchEntries((await source.context(context)).messages);
+    const all = (await source.context(context)).messages;
+    const piId = new Map<string, string>();
+    let next = 0;
+    all.forEach((m: any, i: number) => {
+        if (m.role !== "system") piId.set(live[i].id, `pi${String(next++).padStart(6, "0")}`);
+    });
+    const toPi = (raw: string) => {
+        const hash = raw.indexOf("#");
+        const base = piId.get(hash === -1 ? raw : raw.slice(0, hash));
+        assert.ok(base, `every compressed message is in the Pi file: ${raw}`);
+        return base + (hash === -1 ? "" : raw.slice(hash));
+    };
+    const pocketState = state(id);
+    const piState = {
+        ...pocketState,
+        blocks: pocketState.blocks.map((b: any) => ({
+            ...b,
+            effectiveMessageIds: b.effectiveMessageIds.map(toPi),
+            directMessageIds: b.directMessageIds.map(toPi),
+        })),
+        messageRefs: {
+            byRaw: Object.fromEntries(Object.entries(pocketState.messageRefs.byRaw).filter(([raw]) => piId.has(raw.split("#")[0])).map(([raw, ref]) => [toPi(raw), ref])),
+            byRef: Object.fromEntries(Object.entries(pocketState.messageRefs.byRef).filter(([, raw]) => piId.has(String(raw).split("#")[0])).map(([ref, raw]) => [ref, toPi(String(raw))])),
+        },
+        lastPassIds: [],
+    };
+    assert.equal(piState.blocks.length, 1);
+    const folder = join(process.env.PI_CODING_AGENT_DIR!, "sessions", "--bcp-import--");
+    mkdirSync(folder, { recursive: true });
+    const file = join(folder, "terminal.jsonl");
+    const lines = [{ type: "session", version: 3, id: "terminal-session", timestamp: new Date(1).toISOString(), cwd: work }];
+    messages.forEach((message: any, i: number) => {
+        lines.push({
+            type: "message",
+            id: `pi${String(i).padStart(6, "0")}`,
+            parentId: i === 0 ? null : `pi${String(i - 1).padStart(6, "0")}`,
+            timestamp: new Date(1000 + i).toISOString(),
+            message,
+        } as any);
+    });
+    writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+    writeFileSync(`${file}.acp.json`, JSON.stringify(piState));
+
+    assert.deepEqual((await app.piSessions.preview(owner(app), file)).companions, ["Compression state"]);
+    const continued = await app.commands.continuePiSession(owner(app), file);
+    assert.deepEqual(continued.notes, ["Imported compression from Pi: 1 blocks."]);
+    assert.equal(state(continued.id).blocks.length, 1);
+    await say(app, continued.id, "continue");
+    assert.match(textOf(lastRequest), /SUMMARY_A/);
+    assert.doesNotMatch(textOf(lastRequest), /OLD_LOG_A/);
+});
