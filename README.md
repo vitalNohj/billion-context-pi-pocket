@@ -57,7 +57,7 @@ When switched off, choose:
 
 The extension default is **Restore original history**. Change the default in the extension's Pocket settings. Each chat can override it, or select **Use extension default** again. Turning a chat on/off alone does not create a hidden override.
 
-If Pocket compacts the chat while BCP is off, turning BCP back on starts tracking the **current Pocket summary and retained history**. It does not revive a pre-compaction compressed view. Old ACP files remain in the same state directory; the new tracking epoch uses a separate filename there. Old block IDs belong to their original tracking epoch.
+If Pocket compacts the chat while BCP is off, turning BCP back on starts tracking the **current Pocket summary and retained history**. Pocket’s **New context** action also starts fresh tracking, even if you use the same opening message again. Neither operation revives the previous context’s compressed view. Old ACP files remain in the same state directory; the new tracking epoch uses a separate filename there. Old block IDs belong to their original tracking epoch.
 
 While BCP is on, it continues to decline Pocket's native compaction, including manual `/compact`. Switch the chat off with Restore original history if you want normal Pocket compaction instead.
 
@@ -67,7 +67,7 @@ If the program is missing or damaged, you can still switch the chat off and choo
 
 Existing `extensionName` and `stateDir` settings are preserved. Updating the program does not rename your stored extension identity, move the ACP directory, or delete checkpoints. A verified older bundled copy can continue working until you explicitly install the managed program. Uninstall records an explicit opt-out, so it does not silently reactivate that legacy copy.
 
-Forks inherit only compression available at their fork point. Checkpoints live with the transcript; larger checkpoint data uses a content-addressed store in the existing ACP state directory. New forks and restarts can recover compressed context without copying mutable live session state. Context-head checks prevent an old checkpoint from crossing a native-compaction boundary.
+Forks inherit only compression available at their fork point. Checkpoints live with the transcript; larger checkpoint data uses a content-addressed store in the existing ACP state directory. New forks and restarts can recover compressed context without copying mutable live session state. Context-boundary and saved-pass checks prevent an old checkpoint from crossing a native-compaction or New context boundary, while preserving compatible legacy state.
 
 ## Continuing a terminal Pi session
 

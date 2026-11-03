@@ -164,9 +164,7 @@ function savedState(stateDir: string, id: unknown, epoch = 0) {
     try { return json(file); } catch (error: any) { if (error.code === "ENOENT") return undefined; throw error; }
 }
 function activeStateFits(state: any, messages: readonly any[]) {
-    const present = new Set(branchEntries(messages).map((entry: any) => entry.id));
-    return !state?.blocks?.some((block: any) => block.active && (!Array.isArray(block.effectiveMessageIds)
-        || block.effectiveMessageIds.some((id: string) => !present.has(id.split("#", 1)[0]))));
+    return bridgeModule.stateFitsContext(state, messages);
 }
 
 /** Remove appended BCP action notices while paused, never the summaries within the history. */
@@ -287,9 +285,12 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             // Observe the raw prefix even while off, so native compaction cannot resurrect old BCP checkpoints.
             const sid = String(api.conversationId);
             const before = await epochs.read(sid);
-            const firstMessage = request.messages.find((message: any) => message.role !== "system");
-            const first = firstMessage === undefined ? undefined : branchEntries([firstMessage])[0].id;
-            await epochs.observe(sid, first, before.head === undefined && !activeStateFits(savedState(stateDir, sid), request.messages));
+            const original = branchEntries(request.messages.filter((message: any) => message.role !== "system"));
+            const first = original[0]?.id;
+            const prefix = original.map((entry: any) => `${entry.id}:${entry.timestamp}`);
+            const incompatibleLegacy = before.prefixHash === undefined
+                && !activeStateFits(savedState(stateDir, sid, before.epoch), request.messages);
+            await epochs.observe(sid, first, incompatibleLegacy, prefix);
             if (!mode.enabled && mode.offBehavior === "restore-history") return { messages: withPrompt(request.messages,
                 "Billion context is off for this chat. Do not use its compression tools. Pocket manages context normally.") };
             const value = await kernel(api.conversationId, api, context, request.messages, true);

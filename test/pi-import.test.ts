@@ -71,6 +71,45 @@ function files(state: any) {
     return { dir, companion, target };
 }
 
+test("saved passes require the complete current context, including composite IDs outside an active block", () => {
+    const { state, entries } = fixture(2);
+    const messages = entries.map((entry) => entry.message);
+    const translated = translatePiState(state, entries)!.state;
+    const ids = branchEntries(messages).map((entry) => entry.id);
+    translated.blocks[0].effectiveMessageIds = [`${ids[0]}#tool-call#part`];
+    translated.lastPassIds = [`${ids[0]}#tool-call#part`, ids[1]];
+    const before = structuredClone(translated);
+    assert.equal(mod.stateFitsContext(translated, messages), true);
+    assert.equal(mod.stateFitsContext(translated, [...messages, { role: "user", content: "another turn", timestamp: 3 }]), true);
+    assert.equal(mod.stateFitsContext(translated, messages.slice(0, 1)), false,
+        "an identical surviving block ID cannot hide missing messages from its saved pass");
+    assert.deepEqual(translated, before, "coverage checks do not rewrite saved compression");
+    const legacy = { ...translated, lastPassIds: undefined };
+    assert.equal(mod.stateFitsContext(legacy, messages.slice(0, 1)), true, "legacy states keep the existing block-coverage fallback");
+    assert.equal(mod.stateFitsContext(legacy, messages.slice(1)), false);
+    assert.equal(mod.stateFitsContext({ ...translated, lastPassIds: "invalid" }, messages), false);
+    assert.equal(mod.stateFitsContext(undefined, messages), true);
+});
+
+test("inactive historical blocks do not abandon valid compression or its reference mapping", () => {
+    const { state, entries } = fixture(2);
+    const messages = entries.map((entry) => entry.message);
+    const saved = translatePiState(state, entries)!.state;
+    const ids = branchEntries(messages).map((entry) => entry.id);
+    saved.blocks[0].effectiveMessageIds = [ids[0]];
+    saved.blocks.push({ ...saved.blocks[0], blockId: "b2", active: false,
+        effectiveMessageIds: ["live-deadbeefdeadbeef"], directMessageIds: ["live-deadbeefdeadbeef"] });
+    const before = structuredClone(saved);
+    assert.equal(mod.stateFitsContext(saved, messages), true, "the kernel retains inactive historical blocks");
+    assert.equal(mod.stateFitsContext({ ...saved, lastPassIds: undefined }, messages), true,
+        "legacy states without a saved pass still keep covered active summaries");
+    assert.equal(mod.stateFitsContext(saved, messages.slice(0, 1)), false,
+        "ignoring inactive blocks must not weaken complete saved-pass coverage");
+    assert.equal(mod.stateFitsContext({ ...saved, blocks: saved.blocks.map((block) => ({ ...block, active: true })) }, messages), false,
+        "an uncovered active block still requires a new tracking context");
+    assert.deepEqual(saved, before, "adoption never rewrites blocks or their reference mapping");
+});
+
 test("all Pi IDs map without changing refs, other block fields, or the source", () => {
     const { state, entries } = fixture();
     const before = structuredClone(state);

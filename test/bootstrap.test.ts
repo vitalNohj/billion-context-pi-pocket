@@ -1,13 +1,14 @@
-/** Public HTTP menu routes and real Pocket context hand-off, without contacting a model or npm. */
+/** Public HTTP menu routes and real Pocket context hand-off. Models and owner downloads are faked;
+ * a clean checkout obtains the exact verified npm archive once as test data before installing fetch counters. */
 import { pinArchiveCache } from "./env.ts";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 import { repo, ENTRY, FILES, dropInFolder } from "./fixtures.ts";
+import { pinnedTestArchive } from "./pinned-archive.mjs";
 
 const pocketDir = process.env.PI_POCKET_CHECKOUT;
 const skip = pocketDir && existsSync(join(pocketDir, "test/helpers.ts")) ? false : "set PI_POCKET_CHECKOUT to a Pi Pocket checkout";
@@ -94,9 +95,7 @@ async function withApi(target: any, action: (api: any) => Promise<void>) {
 async function withFreshInstall(name: string, action: (fixture: any) => Promise<void>) {
     const directory = join(h.root, name);
     dropInFolder(join(directory, "extensions"), {}, false);
-    const digest = pin.integrity.slice("sha512-".length);
-    const archive = readFileSync(join(pinArchiveCache, `${Buffer.from(digest, "base64").toString("hex")}.tgz`));
-    assert.equal(createHash("sha512").update(archive).digest("base64"), digest);
+    const archive = await pinnedTestArchive(pin, { cacheDir: pinArchiveCache });
     const originalFetch = globalThis.fetch;
     let downloads = 0;
     let offline = false;
@@ -214,6 +213,41 @@ test("chat Off is isolated and both configurable modes behave as promised", { sk
     });
 });
 
+test("legacy active compression and fork checkpoints survive inactive historical blocks", { skip, timeout: 20_000 }, async () => {
+    const id = await h.newSession(app);
+    await say(app, id, "read A"); await say(app, id, "fold A");
+    const original = saved(dataDir, id);
+    const priorRefs = structuredClone(original.value.messageRefs.byRaw);
+    const active = original.value.blocks.find((block: any) => block.active);
+    assert.ok(active);
+    const legacy = structuredClone(original.value);
+    legacy.blocks.push({ ...active, blockId: "b999", active: false, expanded: true,
+        compressCallId: "historical-compress", effectiveMessageIds: ["live-deadbeefdeadbeef"], directMessageIds: ["live-deadbeefdeadbeef"] });
+    await app.close();
+    // A valid pre-upgrade sidecar has no Pocket epoch marker and may retain expanded historical blocks.
+    writeFileSync(original.file, JSON.stringify(legacy));
+    unlinkSync(join(dataDir, "billion-context-pi-pocket-runtime/contexts", `${id}.json`));
+    app = await h.openApp(scriptedModel(), dataDir);
+    await app.setExtensionEnabled(h.owner(app), ENTRY, true);
+    await say(app, id, "continue with the inherited findings");
+    const resumed = saved(dataDir, id);
+    assert.equal(resumed.epoch, 0, "adoption must retain the existing ACP filename");
+    assert.equal(resumed.file, original.file);
+    assert.match(textOf(trace.messages), /SUMMARY_A/);
+    assert.ok(resumed.value.blocks.some((block: any) => block.active && block.blockId === active.blockId));
+    for (const [raw, ref] of Object.entries(priorRefs)) assert.equal(resumed.value.messageRefs.byRaw[raw], ref);
+    await say(app, id, "read B"); await say(app, id, "fold B");
+    const parent = await app.harness.conversation(id, h.context);
+    const at = (await parent.entries({}, 1, undefined, h.context)).items[0].id;
+    const child = await parent.fork(at, { ownership: { kind: "ownerless" } }, h.context);
+    await (await child.submit({ type: "input", content: [{ type: "text", text: "continue with both findings" }] }, h.context)).wait(h.context);
+    const inherited = saved(dataDir, child.id);
+    assert.match(textOf(trace.messages), /SUMMARY_A/);
+    assert.match(textOf(trace.messages), /SUMMARY_B/);
+    assert.equal(inherited.value.blocks.filter((block: any) => block.active).length, 2,
+        "checkpoint coverage must not reject valid active summaries because of an inactive historical block");
+});
+
 test("a paused fork restores summaries before rendering its first prompt", { skip, timeout: 20_000 }, async () => {
     const id = await h.newSession(app);
     await say(app, id, "read A"); await say(app, id, "fold A");
@@ -291,6 +325,44 @@ test("normal Pocket compaction while Off starts a new ACP epoch without reviving
         assert.doesNotMatch(textOf(trace.messages), /OLD_LOG_B/);
         assert.equal(saved(dataDir, fork.id).value.blocks.length, 1);
     });
+});
+
+test("New context with an identical opening never reuses the previous ACP state", { skip, timeout: 30_000 }, async t => {
+    for (const mode of ["enabled", "restore-history", "keep-summaries"]) {
+        await t.test(mode, async () => {
+            const id = await h.newSession(app);
+            const opening = "REPEATED_CONTEXT_OPENING: keep the original instructions.\n".repeat(200);
+            await say(app, id, opening);
+            await say(app, id, "read A");
+            await say(app, id, "fold A");
+            const original = saved(dataDir, id);
+            assert.equal(original.value.blocks.length, 1);
+            assert.match(original.value.blocks[0].summary, /SUMMARY_A/);
+            const originalBytes = readFileSync(original.file);
+            await withApi(app, async api => {
+                if (mode !== "enabled") await api(`session/${id}`, { enabled: false, offBehavior: mode });
+                const conversation = await app.harness.conversation(id, h.context);
+                await conversation.reset(undefined, h.context);
+                await say(app, id, opening);
+                assert.doesNotMatch(textOf(trace.messages), /SUMMARY_A/,
+                    "the first request after New context must not contain old summaries");
+                assert.match(textOf(trace.messages), /REPEATED_CONTEXT_OPENING/);
+                if (mode !== "enabled") await api(`session/${id}`, { enabled: true });
+                await say(app, id, "continue in the new context");
+                const current = saved(dataDir, id);
+                assert.equal(current.epoch, original.epoch + 1);
+                assert.equal(current.value.blocks.length, 0);
+                assert.notEqual(current.file, original.file);
+                assert.deepEqual(readFileSync(original.file), originalBytes,
+                    "New context preserves the old ACP file instead of rewriting it");
+                assert.doesNotMatch(textOf(trace.messages), /SUMMARY_A/);
+                await say(app, id, "read B");
+                await say(app, id, "fold B");
+                assert.match(saved(dataDir, id).value.blocks[0].summary, /SUMMARY_B/,
+                    "compression must still work in the fresh epoch");
+            });
+        });
+    }
 });
 
 test("paused-view cleanup removes appended action reminders without deleting a summary or original text", { skip }, async () => {

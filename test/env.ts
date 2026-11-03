@@ -6,7 +6,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Pin generation verifies this local archive; capture its location before the test replaces HOME.
+// Reuse the pin-generation cache when present; capture its location before tests replace HOME.
+// A clean checkout can fetch and verify the same pinned archive as test data.
 export const pinArchiveCache = join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "bcp-pins");
 export const testHome = mkdtempSync(join(tmpdir(), "bcp-pocket-test-"));
 process.on("exit", () => rmSync(testHome, { recursive: true, force: true }));

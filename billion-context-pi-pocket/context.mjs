@@ -1,7 +1,10 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { dirname, join, parse, resolve, sep } from 'node:path';
+
+const EMPTY_HEAD = 'live-0000000000000000';
+const digest = prefix => createHash('sha256').update(JSON.stringify(prefix)).digest('hex');
 
 async function directory(path, create) {
     const absolute = resolve(path);
@@ -54,17 +57,44 @@ export class ContextEpochStore {
                 || typeof value.head !== 'string' || !/^live-[a-f0-9]{16}(?![\s\S])/.test(value.head)) {
                 throw new Error('Invalid context marker');
             }
-            return { epoch: value.epoch, head: value.head };
+            const hasProof = value.prefixLength !== undefined || value.prefixHash !== undefined;
+            if (hasProof && (!Number.isSafeInteger(value.prefixLength) || value.prefixLength < 0
+                || typeof value.prefixHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/.test(value.prefixHash))) {
+                throw new Error('Invalid context-prefix proof');
+            }
+            return { epoch: value.epoch, head: value.head, ...(hasProof
+                ? { prefixLength: value.prefixLength, prefixHash: value.prefixHash } : {}) };
         } finally { await file.close(); }
     }
 
-    async observe(id, head, reset = false) {
+    async observe(id, head, reset = false, prefix) {
         const previous = await this.read(id);
-        if (head === undefined || (previous.head === head && !reset)) return previous;
+        if (prefix !== undefined && (!Array.isArray(prefix)
+            || prefix.some(value => typeof value !== 'string' || value.length > 512))) {
+            throw new Error('Invalid context prefix');
+        }
+        if (head === undefined) {
+            if (prefix === undefined) return previous;
+            if (prefix.length !== 0) throw new Error('A non-empty context requires a head');
+            if (previous.head === undefined && !reset) return previous;
+            // Retain a valid format-1 head while recording an explicitly empty context.
+            head = previous.head ?? EMPTY_HEAD;
+        }
         if (!/^live-[a-f0-9]{16}(?![\s\S])/.test(head)) throw new Error('Invalid context identity');
-        const epoch = previous.head === undefined && !reset ? previous.epoch : previous.epoch + 1;
+        const brokenPrefix = prefix !== undefined && previous.prefixLength !== undefined
+            && (prefix.length < previous.prefixLength || digest(prefix.slice(0, previous.prefixLength)) !== previous.prefixHash);
+        const becameEmpty = prefix?.length === 0 && previous.head !== undefined && previous.prefixLength !== 0;
+        // A first message after an observed empty context belongs to that epoch, not another new epoch.
+        const changedHead = previous.head !== undefined && previous.head !== head && previous.prefixLength !== 0;
+        const changed = reset || brokenPrefix || becameEmpty || changedHead;
+        const epoch = previous.epoch + Number(changed);
         if (!Number.isSafeInteger(epoch)) throw new Error('Context epoch exhausted');
-        const next = { format: 1, epoch, head };
+        const proof = prefix !== undefined ? { prefixLength: prefix.length, prefixHash: digest(prefix) }
+            : !changed && previous.prefixLength !== undefined
+                ? { prefixLength: previous.prefixLength, prefixHash: previous.prefixHash } : {};
+        if (previous.epoch === epoch && previous.head === head
+            && previous.prefixLength === proof.prefixLength && previous.prefixHash === proof.prefixHash) return previous;
+        const next = { format: 1, epoch, head, ...proof };
         await directory(this.root, true);
         const target = this.file(id);
         const temporary = join(dirname(target), `.context-${randomBytes(16).toString('hex')}.tmp`);
@@ -79,6 +109,6 @@ export class ContextEpochStore {
             await unlink(temporary).catch(() => {});
             throw error;
         }
-        return { epoch, head };
+        return { epoch, head, ...proof };
     }
 }

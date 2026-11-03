@@ -73,6 +73,18 @@ export function branchEntries(messages: readonly any[]): any[] {
     });
 }
 
+/** A saved pass belongs to this raw context, not merely to an identical opening message. */
+export function stateFitsContext(state: any, messages: readonly any[]): boolean {
+    if (state === undefined) return true;
+    if (!Array.isArray(state?.blocks)) return false;
+    const present = new Set(branchEntries(messages).map((entry) => entry.id));
+    const contains = (id: unknown) => typeof id === "string" && present.has(id.split("#", 1)[0]);
+    if (state.lastPassIds !== undefined && (!Array.isArray(state.lastPassIds) || !state.lastPassIds.every(contains))) return false;
+    // The kernel deliberately retains inactive history whose messages are no longer present.
+    return state.blocks.every((block: any) => !block.active
+        || (Array.isArray(block.effectiveMessageIds) && block.effectiveMessageIds.every(contains)));
+}
+
 export function readState(file: string): any | undefined {
     try {
         const state = JSON.parse(readFileSync(`${file}.acp.json`, "utf8"));
@@ -162,12 +174,8 @@ function restoreCheckpoint(file: string, messages: readonly any[], version: stri
         ) {
             continue;
         }
-        // Legacy checkpoints lack a context boundary. Never restore IDs removed by native compaction.
-        if (checkpoint.contextId === undefined) {
-            const present = new Set(branchEntries(messages).map((entry) => entry.id));
-            if (source.blocks.some((block: any) => !Array.isArray(block.effectiveMessageIds)
-                || block.effectiveMessageIds.some((id: string) => !present.has(id.split("#", 1)[0])))) continue;
-        }
+        // Head text can repeat after New context. Even a tagged checkpoint must fit the complete saved pass.
+        if (!stateFitsContext(source, messages)) continue;
         const restored = {
             ...deriveChildState(source),
             schemaVersion: source.schemaVersion,
