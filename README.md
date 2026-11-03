@@ -1,142 +1,153 @@
 # billion-context-pi-pocket
 
-Runs [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) in [Pi Pocket](https://github.com/TannerMidd/pi-pocket), with compression that survives forks.
+[billion-context-pi](https://github.com/ranxianglei/billion-context-pi) in Pi Pocket, with a menu for installing the program and choosing whether each chat uses it.
 
-billion-context-pi lets the model fold old parts of a long conversation into summaries (`compress`, `decompress`, `search_context`). This extension supplies the terminal extension API that it expects inside Pi Pocket.
-
-**The published billion-context-pi runtime is included.** No separate Pi installation, `pi install`, or npm install is needed on the computer running Pocket. The extension uses Pocket's own Pi packages.
+The Pocket extension is small. It **does not include the whole BCP program** and does not download anything when it loads. The owner presses **Install**, **Update**, or **Repair installation** to obtain an exact, tested version. No separate Pi install, terminal commands, or npm installation scripts are needed.
 
 ## Install
 
-Copy **both** of these into Pi Pocket's `extensions/` folder (`~/.pi-pocket/extensions/` by default):
+### From the extension gallery
 
-```text
-extensions/
-├── billion-context-pi-pocket.ts
-└── billion-context-pi-pocket/     # the whole folder, including bundle.json
-    ├── bundle.json
-    ├── THIRD-PARTY-NOTICES.txt
-    └── billion-context-pi-<version>/
-        ├── LICENSE
-        ├── package.json
-        └── dist/
-```
+The official gallery submission is being prepared; this README does not mean the entry has already been accepted.
 
-Then turn the extension on in Menu → Extensions. The helper folder is not a second extension. Do not copy this repository's development `node_modules` folder.
+Once it is listed:
 
-Read the code before turning it on: a drop-in runs inside Pi Pocket's server, with the owner's rights. Tests run against Pi Pocket **v0.27.0**; newer versions must keep compatible Pi APIs.
+1. Install **billion-context-pi-pocket** from Pocket's extension gallery.
+2. Turn the extension on.
+3. Open **Menu → Billion context** and press **Install**.
 
-## Updates
+### From this repository
 
-A GitHub Actions workflow checks npm's latest stable billion-context-pi release every **6 hours**. It can also run manually from the Actions page.
+1. Download this repository, or check it out.
+2. Put both of these beside each other in your Pocket data folder's `extensions/` directory:
+   - `billion-context-pi-pocket.ts`
+   - the complete `billion-context-pi-pocket/` helper folder
+3. Turn on the extension under **Menu → Extensions**.
+4. Open **Menu → Billion context → Install**.
 
-For a newer release, it:
+The default Pocket data folder is `~/.pi-pocket`; a desktop installation can use a different one. Use that installation's actual data folder, not the directory containing the Pocket application.
 
-1. Pins the exact npm version, package integrity, and upstream source commit.
-2. Copies the complete published runtime unchanged, with its source maps and bundled-dependency license notices.
-3. Verifies the generated files and tests the extension in an isolated Pi Pocket app.
-4. Commits the tested update directly to `main`. It stops if `main` changed during testing, rather than rebasing untested changes.
+Use only one copy of the extension. If you already have it, update the existing entry rather than enabling a second entry with the same tools.
 
-A failed refresh leaves `main` unchanged. The workflow opens or updates an issue with a link to the failed run. Changes to the extension implementation are not generated automatically.
+The extension uses Pocket's public extension API and packages. It does not require a Pocket fork or changes to Pocket's source code. The current minimum compatibility target is Pocket 0.27.0; tests also cover the current development installation.
 
-**Updating this repository does not update an installed copy.** To update a manually installed extension, turn it off, replace the `.ts` file and its entire helper folder together, then turn it on. Keep your settings file and compression state. Runtime directories include the version, so Node cannot reuse the previous release's cached modules after reload.
+## The Billion context menu
 
-The bundled BCP updater is disabled: it cannot replace its code independently under a running Pocket server. No library code is fetched at runtime. This repository does not configure gallery installation or updates.
+The menu is available without the BCP program installed, so you can install or repair it there.
 
-### Upgrading from the old name
+- **Install / Update / Reinstall:** verify the pinned download, check that it can load with this Pocket installation, and activate it only after those checks pass.
+- **Uninstall:** stop using the downloaded program and remove its normal cache. Chats, ACP history, chat choices, and settings remain. If program files are damaged, recovery keeps those objects in a private backup rather than following unsafe links or deleting unknown contents.
+- **Repair installation:** offered after an installation problem. It prepares a verified copy before replacing program files. A verified cached archive can be used offline. Replaced files are retained in a private recovery folder.
+- **Licenses and notices:** the upstream and dependency attribution, including the additional acp-kernel attribution terms.
 
-This project was previously named `billion-context-pi-pocket-adapter`. Its new name is **billion-context-pi-pocket**.
+A failed download or pre-activation check does not replace a working program. Install and repair do not run npm lifecycle scripts. The program downloads from `registry.npmjs.org`; its exact version, URL, archive size, and SHA512 are recorded in [`runtime-lock.json`](billion-context-pi-pocket/runtime-lock.json). The menu shows the version and estimated space before installation.
 
-For a manual installation:
+Successful versions stay cached until Uninstall. Repairs can retain additional recovery backups. An abrupt process stop during repair can leave recovery files; they are not automatically deleted or blindly restored over newer files.
 
-1. Turn off the old module in Menu → Extensions.
-2. Replace its `.ts` file and helper folder with the new names shown above. Do not leave two enabled copies.
-3. Rename `billion-context-pi-pocket-adapter.json` to `billion-context-pi-pocket.json`, if it exists. Keep its contents unchanged.
-4. Turn on the new module. Keep the existing compression state and checkpoints.
+## Turn it on or off for one chat
 
-The extension also reads the old settings filename when the new one is absent. If both files exist, only the new file is used. An invalid new file is an error; it does not silently fall back to the old file.
+Open **Menu → Billion context** from that chat. **Billion context in this chat** affects that chat only, starting with the next model request. It does not interrupt a response already streaming.
 
-**Stored identifiers are not product names.** Keep an existing `extensionName` and `stateDir`, including custom values such as `bcp-adapter` and `bcp`. Sessions and pending work refer to these values. Renaming the project and installation files does not change them or the checkpoint format.
+When switched off, choose:
 
-## Settings
+| Off behavior | What happens |
+| --- | --- |
+| **Restore original history** | Stop using BCP's transformed view. Pocket receives the normal original history and follows its own compaction settings. This does not force an immediate summary or turn on compaction if you disabled it. |
+| **Keep summaries** | Keep existing BCP summaries visible, but stop new compression. The agent can still retrieve existing context. |
 
-All optional. Put them in `billion-context-pi-pocket.json`, next to the `.ts` file:
+The extension default is **Restore original history**. Change the default in the extension's Pocket settings. Each chat can override it, or select **Use extension default** again. Turning a chat on/off alone does not create a hidden override.
 
-```json
-{
-  "stateDir": "billion-context-pi",
-  "extensionName": "billion-context-pi"
-}
-```
+If Pocket compacts the chat while BCP is off, turning BCP back on starts tracking the **current Pocket summary and retained history**. It does not revive a pre-compaction compressed view. Old ACP files remain in the same state directory; the new tracking epoch uses a separate filename there. Old block IDs belong to their original tracking epoch.
 
-| Setting | Default | What it is |
-| --- | --- | --- |
-| `stateDir` | `billion-context-pi`, in Pi Pocket's data folder | Where compression state and fork checkpoints are kept. A relative path is resolved from the data folder |
-| `extensionName` | `billion-context-pi` | The extension's stored name in Pi Pocket. Sessions store it, so do not change it after you start using the extension |
+While BCP is on, it continues to decline Pocket's native compaction, including manual `/compact`. Switch the chat off with Restore original history if you want normal Pocket compaction instead.
 
-An older `billionContextPi` setting is ignored; the extension always uses its included runtime. You can leave that setting in an existing file. Keep your existing `stateDir` and `extensionName` to keep using the same sessions and state.
+If the program is missing or damaged, you can still switch the chat off and choose Restore original history. Recovery must not trap you behind a disabled switch.
 
-billion-context-pi's own settings stay in `~/.pi/acp.json`, with its log in `~/.pi/acp.log`. Automatic decompression output and inline restoration keep upstream behavior. For a non-empty `toFile`, the extension restores the text into a private temporary file, then calls Pocket's normal `write` tool internally. The model still makes one `decompress` call with the same arguments; it does not need a follow-up write call. The requested destination is never written directly by BCP.
+## Existing installations and forks
 
-Custom destinations retain upstream's restriction to the system temporary folder, `~/.cache/opencode`, or `~/.cache/pi`. Pocket's normal write checks, wrappers, and any required approval apply. A denied, unavailable, or failed write returns a decompression error without a direct-write fallback. Temporary export files are removed after success or failure. These working files are separate from saved ACP state and fork checkpoints.
+Existing `extensionName` and `stateDir` settings are preserved. Updating the program does not rename your stored extension identity, move the ACP directory, or delete checkpoints. A verified older bundled copy can continue working until you explicitly install the managed program. Uninstall records an explicit opt-out, so it does not silently reactivate that legacy copy.
 
-Requested file saves require Pi Durable's `executeTool` API, supplied by the tested Pocket v0.27.0. An older or incompatible Pocket fails closed instead of bypassing its file tools. An interrupted `decompress` call is not automatically replayed, because it may already have saved a file.
-
-A settings change takes effect when the extension reloads. Save the `.ts` file, or turn the extension off and on again.
+Forks inherit only compression available at their fork point. Checkpoints live with the transcript; larger checkpoint data uses a content-addressed store in the existing ACP state directory. New forks and restarts can recover compressed context without copying mutable live session state. Context-head checks prevent an old checkpoint from crossing a native-compaction boundary.
 
 ## Continuing a terminal Pi session
 
-This needs a Pi Pocket with `registerPiSessionCompanion`. When you continue a terminal Pi session, the extension imports its `<pi-session>.jsonl.acp.json` compression state if at least 90% of the compressed message IDs match the copied context. It keeps compression refs and summaries, translates message IDs, and does not replace an existing conversation's compression state.
+Install the program from **Menu → Billion context** before continuing a compressed terminal Pi session. On a Pocket version with `registerPiSessionCompanion`, the extension imports the session's `.jsonl.acp.json` sidecar when at least 90% of its compressed message IDs match the copied context. It keeps the compression refs and summaries, translates ordinary and composite message IDs, and never replaces compression already saved for the destination chat.
 
-Without this API, or when the state does not match, history replay is the fallback: billion-context-pi replays the compress calls in the copied history.
+The source sidecar stays untouched. Continuing a session never downloads the program. Without that Pocket API, or if a sidecar does not match, billion-context-pi can replay the compression calls in the copied history instead. The installer, menu, and chat controls do not require this optional API.
 
-## Forks
+## Model tools and plan mode
 
-billion-context-pi keeps its compression state in a file for each session. On its own, a fork starts without that state, so the old messages come back at full size.
+The model keeps the upstream tools and their argument schemas:
 
-After each compression, the extension saves a state checkpoint and puts its ID in the tool result. The model does not see it. A fork restores the newest checkpoint in the history it inherited:
+- `compress`
+- `decompress`
+- `search_context`
+- `acp_status`
+- `acp_cache`
 
-- Later compression in the parent is not carried over.
-- The parent's state is never changed.
-- A fork that already has its own state keeps it.
+An explicit `decompress({ blockId, toFile })` is **one model call**. Our extension restores the text into its own temporary working file and invokes Pocket's normal `write` tool internally. The requested destination goes through Pocket's normal file guard, plan-mode policy, approvals, cancellation, and result handling. The model does not need to remember a follow-up write call. Temporary bridge files are removed afterwards.
 
-Sessions compressed before checkpoints existed fall back to billion-context-pi's own replay of the compress calls in their history.
+`decompress` can write files and is therefore **not marked read-only**. Pocket blocks it in plan mode, even when a particular call would have requested inline output. Compression, search, and status remain available there; a chat switched off still rejects new compression. This preserves the same tool interface rather than introducing a second export tool or incorrectly claiming all decompression is read-only.
 
-Checkpoints are stored in `checkpoints/` inside the state folder, one file per state. They are not deleted automatically.
+BCP's own automatic decompression output can use `~/.cache/pi/acp-decompress/`. Explicit destinations retain upstream's restrictions to temporary/cache locations; they are additionally checked by Pocket's normal file tool. No decompression export uploads chat text anywhere.
 
-## Plan mode
+## Files and settings
 
-The extension marks `compress`, `search_context`, `acp_status`, and `acp_cache` as read-only (`annotations: { readOnlyHint: true }`), since they change only the conversation context. Compression and search remain available while Pi plans.
+An optional `billion-context-pi-pocket.json` beside the entry accepts:
 
-`decompress` keeps its existing name and arguments, including `toFile`, but is **not** marked read-only: it can save a requested file. Pocket currently checks the outer tool before any nested write, so **all `decompress` calls are blocked in plan mode**, even `inline: true`. Approve or leave plan mode before decompression. This is a permission correction, not a move or reset of ACP data. Delegate tools that start subagents also remain blocked.
+```json
+{
+  "extensionName": "billion-context-pi",
+  "stateDir": "billion-context-pi",
+  "offBehavior": "restore-history"
+}
+```
 
-## Terminal-only features
+- `extensionName`: the stored extension identity. Keep a custom value if you already use one.
+- `stateDir`: an absolute directory or a path relative to Pocket's data folder. Keep the existing value on an established installation.
+- `offBehavior`: `restore-history` or `keep-summaries`. Pocket's extension setting can supply the global default; a chat can override it.
 
-Pi Pocket has no terminal UI, so these billion-context-pi features are ignored:
+The previous `billion-context-pi-pocket-adapter.json` filename remains a fallback when the new settings filename is absent. The old `billionContextPi` package-path setting is no longer used; installation must select verified pinned code, not an arbitrary directory.
 
-- Slash commands
-- Keyboard shortcuts
-- The status line
-- Custom message rendering
+The managed program and its archives live under:
 
-Loading the extension sets `PI_ACP_FORK_HOST=1` for operation outside Pi's terminal, and `ACP_AUTO_UPDATE=0` to disable the bundled updater. These are process-wide environment settings.
+```text
+<Pocket data>/billion-context-pi-pocket-runtime/
+  archives/
+  packages/
+  contexts/
+  selection.json
+  .recovery-*/       # private repair backups, when needed
+```
 
-## Development and verification
+This is separate from `stateDir`, which contains ACP's saved compression and checkpoint objects. The `contexts/` records track the current history epoch; they are not a replacement location for ACP history. Program Uninstall leaves those records and your state directory intact.
 
-Requires Node.js **22.19 or newer**, npm, and a Pi Pocket checkout with its dependencies installed. Dependencies in this repository are build/test inputs, not installation requirements for users.
+The upstream self-updater is disabled with `ACP_AUTO_UPDATE=0`. Pocket forks use `PI_ACP_FORK_HOST=1`. The integration ignores upstream terminal UI commands/renderers and does not expose its late-registered delegate tools.
+
+## Updates and gallery review
+
+The **Refresh pins** GitHub workflow checks published npm releases every 6 hours. It verifies provenance and licenses, captures the tool contract, and runs the tests before updating this repository. It does not modify upstream's program code, mirror every upstream source commit, or publish an incompatible tool schema automatically.
+
+A gallery installation may download only releases pinned in its reviewed extension version. Update the extension through Pocket's normal extension updates, then use its Billion context menu to update the program. The menu does not fetch an arbitrary npm “latest” or update the extension itself behind Pocket's review process.
+
+New gallery versions still need a reviewed index PR. The repository's automated pin refresh is not a substitute for that approval.
+
+## Development
+
+Use a current Node version supported by Pocket. Tests use scripted models and disposable Pocket data, not real providers or the user's ACP configuration.
 
 ```sh
 npm ci --ignore-scripts
-npm run verify-bundle
+npm run pins
 PI_POCKET_CHECKOUT=/path/to/pi-pocket npm test
 ```
 
-Use `npm run bundle` to regenerate the checked-in runtime and notices from the pinned dependencies. Use `npm run check-upstream` to check for a new stable release, and `npm run refresh -- <version>` to refresh the pins and bundle. The exact version, npm integrity, source commit, and bundled dependency versions are recorded in `upstream.json` and the helper folder's `bundle.json`.
+`npm run pins` downloads and checks the exact locked archives, generates the small lock/tool-contract/license files, and verifies the author cache used by installation tests. It does not put the program in the gallery helper folder. Generation runs in an isolated home; dependency license inspection can use a larger bounded archive-entry limit, while production installations retain the strict default limit.
 
-The tests copy the extension and bundle outside this repository. They load them through a test Pocket app's `extensions/node_modules` link. A scripted model makes no real provider requests. A temporary home folder keeps your `~/.pi`, Pi Pocket data, and live extension untouched. Tests cover registration, compression, forks, reloads, automatic and custom decompression output, unchanged tool parameters, settings compatibility, and plan-mode restrictions. They exercise Pocket's actual guard hook and approval machinery with controlled allow/block/ask verdicts, not the downloaded Lancet classifier. Tests also verify one model call, denied-write preservation, write failures, private scratch-file cleanup, and fail-closed behavior. CI rejects a missing Pocket checkout instead of silently skipping those tests.
+On shared machines, apply the repository owner's CPU limits to builds, pin generation, and every test invocation. The test runner uses one concurrent test file.
 
-## Licenses
+## Credits and license
 
-This extension is [MIT](LICENSE). Included third-party code retains its own licenses. The BCP package's license is in its versioned runtime folder; full notices for code bundled into BCP are in [`THIRD-PARTY-NOTICES.txt`](billion-context-pi-pocket/THIRD-PARTY-NOTICES.txt).
+This integration is MIT-licensed; see [LICENSE](LICENSE).
 
-`acp-kernel`'s published license includes an additional product-attribution term. Its full text is retained in the notices; the unchanged BCP runtime also retains its attribution footer. Do not assume that this extension's MIT license replaces bundled dependencies' license terms.
+It uses [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) and [acp-kernel](https://github.com/ranxianglei/acp-kernel) by ranxianglei. Related project: [billion-context](https://github.com/ranxianglei/billion-context). The downloaded program is unchanged upstream code. Upstream licenses and notices are preserved in the program archive and in [THIRD-PARTY-NOTICES.txt](billion-context-pi-pocket/THIRD-PARTY-NOTICES.txt); the menu also shows the attribution and full notices.

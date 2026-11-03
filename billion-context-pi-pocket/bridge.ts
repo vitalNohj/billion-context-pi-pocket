@@ -1,0 +1,687 @@
+/** Pi-to-Pocket bridge and compression checkpoints. Loaded only after the runtime is verified. */
+import { createHash } from "node:crypto";
+import {
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    readFileSync,
+    readlinkSync,
+    realpathSync,
+    renameSync,
+    writeFileSync,
+} from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+    AgentDoc,
+    CompactionTask,
+    defineExtension,
+    defineTool,
+    GenerationTask,
+    hook,
+    section,
+    ToolTask,
+} from "@earendil-works/pi-durable";
+
+export const CHECKPOINT_KEY = "pocketBcpCheckpoint";
+
+// ---- fork checkpoints ----
+
+// Must match billion-context-pi's messageIdentity/stableLiveId: saved state already uses these IDs.
+const REF_SOURCE = "(?:<acp\\s[^>]*>m\\d{5}</acp>|\\[m\\d{1,5}\\])";
+const LEADING_REF = new RegExp(`^${REF_SOURCE}\\s?\\n?`);
+const TRAILING_REF = new RegExp(`\\n*${REF_SOURCE}\\s*$`);
+const stripRef = (text: string) => text.replace(LEADING_REF, "").replace(TRAILING_REF, "");
+
+function normalize(value: any, message = false): any {
+    if (Array.isArray(value)) {
+        return value.flatMap((item) => {
+            if (item?.type === "text" && typeof item.text === "string") {
+                const stripped = stripRef(item.text);
+                if (item.text !== stripped && stripped === "") return [];
+            }
+            return [normalize(item)];
+        });
+    }
+    if (value === null || typeof value !== "object") return value;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+        if (message && key === "timestamp") continue;
+        const item = value[key];
+        if (message && key === "content" && typeof item === "string") {
+            out[key] = [{ text: stripRef(item), type: "text" }];
+        } else if (key === "text" && typeof item === "string" && value.type === "text") {
+            out[key] = stripRef(item);
+        } else {
+            out[key] = normalize(item);
+        }
+    }
+    return out;
+}
+
+/** The untransformed, fork-bounded request history as session entries, with billion-context-pi's stable IDs. */
+export function branchEntries(messages: readonly any[]): any[] {
+    const ranks = new Map<string, number>();
+    return messages.map((message) => {
+        const identity = JSON.stringify(normalize(message, true));
+        const rank = ranks.get(identity) ?? 0;
+        ranks.set(identity, rank + 1);
+        const id = `live-${createHash("sha256").update(`${identity}\0${rank}`).digest("hex").slice(0, 16)}`;
+        return { type: "message", id, parentId: null, timestamp: String(message.timestamp ?? 0), message };
+    });
+}
+
+export function readState(file: string): any | undefined {
+    try {
+        const state = JSON.parse(readFileSync(`${file}.acp.json`, "utf8"));
+        if (Array.isArray(state?.blocks)) return state;
+    } catch (error: any) {
+        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    }
+    return undefined;
+}
+
+/** Immutable, content-addressed objects keep checkpoints out of already-large chat histories. */
+function objectPath(file: string, id: string): string | undefined {
+    if (!/^[a-f0-9]{64}$/.test(id)) return undefined;
+    return join(dirname(file), "checkpoints", `${id}.json`);
+}
+
+function saveObject(file: string, value: unknown): string {
+    const content = JSON.stringify(value);
+    const id = createHash("sha256").update(content).digest("hex");
+    const target = objectPath(file, id)!;
+    if (!existsSync(target)) {
+        mkdirSync(dirname(target), { recursive: true });
+        const temporary = `${target}.${process.pid}.tmp`;
+        writeFileSync(temporary, content, { mode: 0o600 });
+        renameSync(temporary, target);
+    }
+    return id;
+}
+
+function loadObject(file: string, id: unknown): any | undefined {
+    if (typeof id !== "string") return undefined;
+    const target = objectPath(file, id);
+    if (target === undefined) return undefined;
+    try {
+        const content = readFileSync(target, "utf8");
+        if (createHash("sha256").update(content).digest("hex") !== id) return undefined;
+        return JSON.parse(content);
+    } catch (error: any) {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+    }
+}
+
+/** The checkpoint for a compress call (or a codemode script that made one): only IDs, no copies of old messages. */
+function checkpointFor(file: string, conversationId: string, callId: string, version: string, contextId?: string): any | undefined {
+    const state = readState(file);
+    const made = state?.blocks.some(
+        (block: any) => block.compressCallId === callId || block.compressCallId?.startsWith(`${callId}/`),
+    );
+    if (!made) return undefined;
+    // Deduplicate block bodies across checkpoints, and leave out origins (which repeat whole messages).
+    const { liveRefOrigins: _origins, derivedFrom: _parent, blocks, ...snapshot } = state;
+    const blockIds = blocks.map((block: any) => saveObject(file, block));
+    const stateId = saveObject(file, { ...snapshot, blockIds });
+    return { version: 2, bcpVersion: version, conversationId, stateId, ...(contextId === undefined ? {} : { contextId }) };
+}
+
+/** Restore the newest checkpoint in a fork's inherited history; never replace state the fork already has. */
+function restoreCheckpoint(file: string, messages: readonly any[], version: string, deriveChildState: (state: any) => any, contextId?: string): string | undefined {
+    if ((readState(file)?.blocks.length ?? 0) > 0) return undefined;
+    // Only checkpoints present at the fork cutoff can be selected.
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (message.role !== "toolResult") continue;
+        const checkpoint = message.details?.[CHECKPOINT_KEY];
+        if (checkpoint?.bcpVersion !== version) continue;
+        if (contextId !== undefined && checkpoint.contextId !== undefined && checkpoint.contextId !== contextId) continue;
+        let source: any;
+        if (checkpoint.version === 2) {
+            const manifest = loadObject(file, checkpoint.stateId);
+            if (!Array.isArray(manifest?.blockIds)) continue;
+            const blocks = manifest.blockIds.map((id: unknown) => loadObject(file, id));
+            if (blocks.some((block: any) => typeof block?.blockId !== "string")) continue;
+            const { blockIds: _ids, ...state } = manifest;
+            source = { ...state, blocks };
+        } else if (checkpoint.version === 1) {
+            // The whole state inline, as the first version of this adapter saved it.
+            source = checkpoint.state;
+        } else {
+            continue;
+        }
+        if (
+            !Array.isArray(source?.blocks) ||
+            source.blocks.length === 0 ||
+            !source.messageRefs?.byRaw ||
+            !source.messageRefs?.byRef
+        ) {
+            continue;
+        }
+        // Legacy checkpoints lack a context boundary. Never restore IDs removed by native compaction.
+        if (checkpoint.contextId === undefined) {
+            const present = new Set(branchEntries(messages).map((entry) => entry.id));
+            if (source.blocks.some((block: any) => !Array.isArray(block.effectiveMessageIds)
+                || block.effectiveMessageIds.some((id: string) => !present.has(id.split("#", 1)[0])))) continue;
+        }
+        const restored = {
+            ...deriveChildState(source),
+            schemaVersion: source.schemaVersion,
+            producer: source.producer,
+            derivedFrom: { parentSessionId: String(checkpoint.conversationId), derivedAt: Date.now() },
+            liveRefOrigins: [],
+        };
+        const target = `${file}.acp.json`;
+        const temporary = `${target}.fork-${process.pid}`;
+        writeFileSync(temporary, JSON.stringify(restored), { mode: 0o600 });
+        renameSync(temporary, target);
+        return String(checkpoint.conversationId);
+    }
+    return undefined;
+}
+
+// ---- terminal Pi imports ----
+
+type PiImportEntry = { from?: string; id: unknown; message: any };
+
+/** Translate terminal Pi entry IDs without changing the compression refs or the source state. */
+export function translatePiState(
+    state: any,
+    entries: readonly PiImportEntry[],
+): { state: any; mapped: number; total: number } | undefined {
+    if (
+        !Array.isArray(state?.blocks) ||
+        state.blocks.length === 0 ||
+        !state.messageRefs?.byRaw ||
+        !state.messageRefs?.byRef
+    ) {
+        return undefined;
+    }
+    const live = branchEntries(entries.map((entry) => entry.message));
+    // Duplicate-message ranks use the whole copied context and can differ if a later request changes that context.
+    const map = new Map<string, string>();
+    entries.forEach((entry, i) => {
+        if (entry.from !== undefined && !map.has(entry.from)) map.set(entry.from, live[i].id);
+    });
+    const translateId = (id: string): string | undefined => {
+        // Multi-tool-call messages use <entry>#<tool-call>; only the entry part changes between hosts.
+        const hash = id.indexOf("#");
+        const base = hash === -1 ? id : id.slice(0, hash);
+        const liveId = map.get(base);
+        return liveId === undefined ? undefined : liveId + (hash === -1 ? "" : id.slice(hash));
+    };
+    const ids = new Set<string>(state.blocks.flatMap((block: any) => block.effectiveMessageIds));
+    const mapped = [...ids].filter((id) => translateId(id) !== undefined).length;
+    const translateIds = (ids: readonly string[]) => ids.flatMap((id) => {
+        const translated = translateId(id);
+        return translated === undefined ? [] : [translated];
+    });
+    const translated = {
+        ...state,
+        blocks: state.blocks.map((block: any) => ({
+            ...block,
+            effectiveMessageIds: translateIds(block.effectiveMessageIds),
+            directMessageIds: translateIds(block.directMessageIds),
+        })).filter((block: any) => block.effectiveMessageIds.length > 0),
+        messageRefs: {
+            ...state.messageRefs,
+            byRaw: Object.fromEntries(Object.entries(state.messageRefs.byRaw).flatMap(([id, ref]) => {
+                const translated = translateId(id);
+                return translated === undefined ? [] : [[translated, ref]];
+            })),
+            byRef: Object.fromEntries(Object.entries(state.messageRefs.byRef).flatMap(([ref, id]) => {
+                const translated = translateId(id as string);
+                return translated === undefined ? [] : [[ref, translated]];
+            })),
+        },
+        ...(state.lastPassIds === undefined ? {} : { lastPassIds: translateIds(state.lastPassIds) }),
+    };
+    return { state: translated, mapped, total: ids.size };
+}
+
+/** Import a matching terminal sidecar atomically; keep any compression the conversation already has. */
+export function importPiState(
+    companion: string,
+    entries: readonly PiImportEntry[],
+    target: string,
+    deriveChildState: (state: any) => any,
+): { blocks: number; mapped: number; total: number } | undefined {
+    if ((readState(target)?.blocks.length ?? 0) > 0) return undefined;
+    let source: any;
+    try {
+        source = JSON.parse(readFileSync(companion, "utf8"));
+    } catch (error: any) {
+        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+        return undefined;
+    }
+    const translated = translatePiState(source, entries);
+    if (translated === undefined || translated.total === 0 || translated.mapped / translated.total < 0.9) return undefined;
+    const restored = {
+        ...deriveChildState(translated.state),
+        schemaVersion: translated.state.schemaVersion,
+        producer: translated.state.producer,
+        derivedFrom: { piSession: companion.slice(0, -".acp.json".length), derivedAt: Date.now() },
+        liveRefOrigins: [],
+    };
+    const file = `${target}.acp.json`;
+    const temporary = `${file}.pi-import-${process.pid}`;
+    writeFileSync(temporary, JSON.stringify(restored), { mode: 0o600 });
+    renameSync(temporary, file);
+    return { blocks: restored.blocks.length, mapped: translated.mapped, total: translated.total };
+}
+
+// ---- the adapter ----
+
+type Level = "info" | "warning" | "error";
+/** The part of Pi Pocket's host this uses. */
+type Host = { dataDir: string; notice(level: Level, message: string, conversationId?: string): void };
+type Handler = (event: any, ctx: any) => unknown;
+type PiTool = {
+    name: string;
+    description: string;
+    parameters: any;
+    annotations?: Record<string, unknown>;
+    execute(toolCallId: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: any): Promise<any>;
+};
+
+/**
+ * Tools that only change what the model sees of the conversation, never files, commands, or anything outside it, so
+ * Pocket's plan mode may run them. The delegate tools start subagents and stay blocked there.
+ */
+const CONTEXT_ONLY = new Set(["compress", "search_context", "acp_status", "acp_cache"]);
+
+/** The tool's own annotations, marked read-only when it only changes the model's view (Pocket's plan mode reads it). */
+function annotationsOf(tool: PiTool): { annotations?: Record<string, unknown> } {
+    // A requested export calls Pocket's write tool. Do not promise that this tool is read-only, even when that write
+    // is itself guarded. Pocket currently checks the outer tool before it can make a nested call.
+    if (tool.name === "decompress") {
+        return { annotations: { ...tool.annotations, readOnlyHint: false } };
+    }
+    if (!CONTEXT_ONLY.has(tool.name)) {
+        return tool.annotations === undefined ? {} : { annotations: tool.annotations };
+    }
+    return { annotations: { ...tool.annotations, readOnlyHint: true } };
+}
+
+/**
+ * Preserve billion-context-pi 0.1.83's temp/cache destination policy. Adapted from its MIT-licensed
+ * src/decompress-tool.ts; the pinned upstream version and its license are recorded in runtime-lock.json,
+ * BCP-LICENSE.txt, and THIRD-PARTY-NOTICES.txt. The installed package also retains its original files.
+ * Only Pocket's write tool receives this destination: BCP receives a separate extension-created scratch file.
+ */
+function decompressionDestination(targetPath: string): string | { error: string } {
+    const expanded = targetPath.startsWith("~/") ? join(homedir(), targetPath.slice(2)) : targetPath;
+    let checked = resolve(expanded);
+    let probe = checked;
+    const suffix: string[] = [];
+    while (!existsSync(probe) && probe !== dirname(probe)) {
+        suffix.unshift(basename(probe));
+        probe = dirname(probe);
+    }
+    checked = existsSync(probe) ? realpathSync(probe) : probe;
+    for (const part of suffix) {
+        checked = join(checked, part);
+        try {
+            if (lstatSync(checked).isSymbolicLink()) {
+                const target = readlinkSync(checked);
+                checked = isAbsolute(target) ? resolve(target) : resolve(dirname(checked), target);
+            }
+        } catch {
+            // The destination or a parent does not exist yet, just as in the upstream resolver.
+        }
+    }
+    const allowed = [tmpdir(), join(homedir(), ".cache", "opencode"), join(homedir(), ".cache", "pi")];
+    const permitted = allowed.some((folder) => {
+        let root = folder;
+        try { root = realpathSync(folder); } catch { /* A cache folder need not exist yet. */ }
+        const path = relative(root, checked);
+        return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+    });
+    return permitted ? checked : {
+        error: `Error: toFile path must be under ${tmpdir()}, ~/.cache/opencode, or ~/.cache/pi. Got: ${targetPath}`,
+    };
+}
+
+/**
+ * A requested export remains one decompress call to the model. BCP restores into our scratch file; the actual
+ * destination is written only by a nested Pocket write call, so its guards, approvals, and wrappers still apply.
+ * Automatic output and inline decompression do not use this path and keep upstream behavior.
+ */
+export async function decompressToFile(
+    tool: PiTool,
+    args: Record<string, unknown> & { toFile: string },
+    toolApi: any,
+    context: any,
+    ctx: any,
+): Promise<any> {
+    const destination = decompressionDestination(args.toFile);
+    const failure = (text: string) => ({ isError: true, content: [{ type: "text", text }] });
+    if (typeof destination !== "string") return failure(destination.error);
+    if (typeof toolApi.executeTool !== "function") {
+        return failure("Cannot save decompressed text: this Pocket version has no guarded nested tool execution. No destination file was written.");
+    }
+    const scratch = await mkdtemp(join(tmpdir(), "billion-context-pi-pocket-decompress-"));
+    const file = join(scratch, "restored.txt");
+    try {
+        const result = await tool.execute(
+            toolApi.callId, { ...args, toFile: file }, context.abortSignal, undefined, ctx,
+        );
+        if (result?.isError === true) return result;
+        let content: string;
+        try {
+            content = await readFile(file, "utf8");
+        } catch (error: any) {
+            // Invalid refs, missing blocks, and refused runtimes return explanatory text without creating a file.
+            if (error.code === "ENOENT") return result;
+            throw error;
+        }
+        // Pocket's codemode can forward one parent's executeTool API to several calls. Include this call's ID so
+        // exports in the same script never reuse a durable nested-call key with different paths or content.
+        const key = `decompressed-file-${createHash("sha256").update(toolApi.callId).digest("hex")}`;
+        const written = await toolApi.executeTool(
+            "write", { path: destination, content }, context, { key },
+        );
+        if (written.isError) {
+            const reason = written.diagnostics?.map((item: any) => item.message).filter(Boolean).join("\n")
+                || (typeof written.structuredOutput === "string" ? written.structuredOutput : "Pocket's write tool did not save the file.");
+            return failure(`Could not save decompressed text to ${destination}.\n${reason}`);
+        }
+        return {
+            ...result,
+            content: result.content?.map((part: any) => part.type === "text"
+                ? { ...part, text: part.text.replace(file, () => destination) }
+                : part),
+        };
+    } finally {
+        await rm(scratch, { recursive: true, force: true }).catch((error) => {
+            ctx.ui.notify(`Could not remove decompression scratch folder ${scratch}: ${String(error)}`, "warning");
+        });
+    }
+}
+
+/** A value that survives JSON (Pi Durable stores details as JSON). */
+function json(value: unknown): any {
+    if (value === undefined) return undefined;
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return undefined;
+    }
+}
+
+/** Pi Pocket calls this synchronously: everything asynchronous happens at import or in the hooks. */
+export function createBridge(host: Host, bcp: any, version: string, options: { stateDir: string; extensionName: string; epoch: number; contextId?: string; systemPrompt?: string }) {
+    const { stateDir, extensionName } = options;
+    const factory = bcp.default;
+    const deriveChildState = bcp.deriveChildState;
+    mkdirSync(stateDir, { recursive: true });
+
+    const handlers = new Map<string, Handler[]>();
+    const tools: PiTool[] = [];
+    const ignored = new Set<string>();
+    const pi: Record<string, unknown> = {
+        on(event: string, handler: Handler) {
+            handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        },
+        registerTool(tool: PiTool) {
+            if (!tools.some((t) => t.name === tool.name)) tools.push(tool);
+        },
+        events: { on: () => () => {}, emit: () => {} },
+    };
+    const api = new Proxy(pi, {
+        get(target, key) {
+            if (typeof key !== "string") return undefined;
+            if (key in target) return target[key];
+            // registerCommand, registerShortcut, registerEntryRenderer, appendEntry, sendUserMessage, ...
+            return () => {
+                if (ignored.has(key)) return;
+                ignored.add(key);
+                console.log(`[${extensionName}] pi API "${key}" is not available in Pi Pocket: ignored`);
+            };
+        },
+        // billion-context-pi checks `typeof pi.appendEntry === "function"` and the like: report only what works.
+        has: (target, key) => key in target,
+    });
+
+    factory(api);
+
+    // ---- per-conversation pi context ----
+
+    const started = new Map<string, Promise<void>>();
+    const branches = new Map<string, any[]>();
+    const prepared = new Set<string>();
+
+    function sessionFile(conversationId: string): string {
+        const suffix = options.epoch === 0 ? "" : `.context-${options.epoch}`;
+        const file = join(stateDir, `${conversationId}${suffix}.jsonl`);
+        if (!existsSync(file)) writeFileSync(file, "");
+        return file;
+    }
+
+    /** `conversationId` is Pi Durable's own ID: passed unchanged to Pi Durable, as a string to billion-context-pi. */
+    async function modelOf(read: any, models: any, conversationId: unknown, context: unknown) {
+        const agent = await read.snapshot(AgentDoc, conversationId, context);
+        const ref = agent?.model as { provider: string; modelId: string } | undefined;
+        const cwd = agent?.cwd as string | undefined;
+        return { cwd, model: ref === undefined ? undefined : models.getModel(ref.provider, ref.modelId) };
+    }
+
+    function ctxFor(conversationId: string, model: unknown, cwd: string | undefined) {
+        const file = sessionFile(conversationId);
+        const branch = () => branches.get(conversationId) ?? [];
+        const notify = (message: string, level?: string) =>
+            host.notice(
+                level === "error" ? "error" : level === "warning" ? "warning" : "info",
+                String(message),
+                conversationId,
+            );
+        return {
+            cwd: cwd ?? process.cwd(),
+            model,
+            mode: "rpc",
+            hasUI: false,
+            ui: new Proxy({ notify } as Record<string, unknown>, {
+                get: (target, key) => (typeof key === "string" && key in target ? target[key] : () => undefined),
+            }),
+            sessionManager: {
+                getSessionId: () => conversationId,
+                getSessionFile: () => file,
+                getCwd: () => cwd ?? process.cwd(),
+                // The request's own history, already bounded by Pi Durable's fork cutoff.
+                getBranch: branch,
+                getEntries: branch,
+                getEntry: (id: string) => branch().find((entry) => entry.id === id),
+                getHeader: () => undefined,
+                getLeafId: () => branch().at(-1)?.id ?? null,
+            },
+            getSystemPrompt: () => options.systemPrompt ?? "",
+            abort: () => {},
+            isIdle: () => false,
+        };
+    }
+
+    async function fire(event: string, payload: Record<string, unknown>, ctx: unknown): Promise<unknown[]> {
+        const results: unknown[] = [];
+        for (const handler of handlers.get(event) ?? []) {
+            results.push(await handler({ type: event, ...payload }, ctx));
+        }
+        return results;
+    }
+
+    /** `session_start` once per conversation for this load of the module (a restart or reload starts again). */
+    function start(conversationId: string, ctx: unknown): Promise<void> {
+        let done = started.get(conversationId);
+        if (done === undefined) {
+            done = fire("session_start", { reason: "startup" }, ctx).then(() => undefined);
+            started.set(conversationId, done);
+        }
+        return done;
+    }
+
+    async function contextFor(hookApi: any, context: unknown) {
+        const { model, cwd } = await modelOf(hookApi, hookApi.models, hookApi.conversationId, context);
+        const ctx = ctxFor(String(hookApi.conversationId), model, cwd);
+        await start(String(hookApi.conversationId), ctx);
+        return ctx;
+    }
+
+    // ---- tools ----
+
+    const durableTools = tools.map((tool) =>
+        defineTool({
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            ...annotationsOf(tool),
+            // Compression changes state; decompression can save a requested file. Neither may repeat after a crash.
+            replay: tool.name === "compress" || tool.name === "decompress" ? "unsafe" : "safe",
+            execute: async (args: unknown, toolApi: any, context: any) => {
+                const ctx = await contextFor(toolApi, context);
+                const params = args as Record<string, unknown>;
+                const result = tool.name === "decompress" && typeof params.toFile === "string" && params.toFile !== ""
+                    ? await decompressToFile(tool, params as Record<string, unknown> & { toFile: string }, toolApi, context, ctx)
+                    : await tool.execute(toolApi.callId, args, context.abortSignal, undefined, ctx);
+                return {
+                    content: result?.content ?? [{ type: "text" as const, text: "" }],
+                    ...(result?.isError === true ? { isError: true } : {}),
+                    ...(result?.details !== undefined ? { details: json(result.details) } : {}),
+                };
+            },
+        }),
+    );
+
+    // ---- system prompt ----
+
+    const prompt = section(
+        "billion_context",
+        async (input: any) => {
+            const ref = input.agent?.model as { provider: string; modelId: string } | undefined;
+            const model = ref === undefined ? undefined : { provider: ref.provider, id: ref.modelId };
+            const ctx = ctxFor(String(input.conversationId), model, input.agent?.cwd);
+            await start(String(input.conversationId), ctx);
+            let text = "";
+            for (const result of await fire("before_agent_start", { systemPrompt: "", prompt: "" }, ctx)) {
+                const next = (result as { systemPrompt?: string } | undefined)?.systemPrompt;
+                if (typeof next === "string") text = next;
+            }
+            text = text.replace(/^\s+/, "");
+            return text === "" ? undefined : text;
+        },
+        { tag: false },
+    );
+
+    // ---- hooks ----
+
+    async function prepare(request: any, hookApi: any, _context: any) {
+        const sid = String(hookApi.conversationId);
+        // Capture the actual fork-bounded history and restore it before rendering a prompt from saved summaries.
+        branches.set(sid, branchEntries(request.messages));
+        if (!prepared.has(sid)) {
+            try {
+                const source = restoreCheckpoint(sessionFile(sid), request.messages, version, deriveChildState, options.contextId);
+                if (source !== undefined) {
+                    started.delete(sid);
+                    host.notice("info", `Restored compression inherited from session ${source}.`, sid);
+                }
+            } catch (error) {
+                host.notice(
+                    "warning",
+                    `Could not restore inherited compression; replaying its compress calls instead: ${String(error)}`,
+                    sid,
+                );
+            }
+            prepared.add(sid);
+        }
+    }
+
+    const generation = hook(GenerationTask, {
+        beforeRequest: async (request: any, hookApi: any, context: any) => {
+            await prepare(request, hookApi, context);
+            const ctx = await contextFor(hookApi, context);
+            let messages = [...request.messages];
+            for (const result of await fire("context", { messages }, ctx)) {
+                const next = (result as { messages?: unknown[] } | undefined)?.messages;
+                if (Array.isArray(next)) messages = next;
+            }
+            return { messages };
+        },
+        afterResponse: async (message: any, hookApi: any, context: any) => {
+            await fire("message_end", { message }, await contextFor(hookApi, context));
+        },
+    } as any);
+
+    const toolHooks = hook(ToolTask, {
+        beforeTool: async (call: any, hookApi: any, context: any) => {
+            if (!handlers.has("tool_call")) return undefined;
+            const ctx = await contextFor(hookApi, context);
+            const input = json(call.arguments) ?? {};
+            const before = JSON.stringify(input);
+            for (const result of await fire("tool_call", { toolName: call.name, toolCallId: call.id, input }, ctx)) {
+                const r = result as { block?: boolean; reason?: string } | undefined;
+                if (r?.block === true) return { block: r.reason ?? "Blocked by billion-context-pi." };
+            }
+            return JSON.stringify(input) === before ? undefined : { arguments: input };
+        },
+        afterTool: async (call: any, result: any, hookApi: any, context: any) => {
+            const sid = String(hookApi.conversationId);
+            const ctx = await contextFor(hookApi, context);
+            let next = result;
+            const outcomes = await fire(
+                "tool_result",
+                {
+                    toolName: call.name,
+                    toolCallId: call.id,
+                    input: call.arguments,
+                    content: result.content ?? [],
+                    details: result.details,
+                    isError: result.isError === true,
+                },
+                ctx,
+            );
+            for (const outcome of outcomes) {
+                const o = outcome as { content?: unknown; details?: unknown; isError?: boolean } | undefined;
+                if (o === undefined) continue;
+                next = {
+                    ...next,
+                    ...(o.content !== undefined ? { content: o.content } : {}),
+                    ...(o.details !== undefined ? { details: json(o.details) } : {}),
+                    ...(o.isError !== undefined ? { isError: o.isError } : {}),
+                };
+            }
+            // Codemode drops a nested compress's details, so its outer result carries the checkpoint too.
+            if (call.name === "compress" || call.name === "codemode") {
+                try {
+                    const checkpoint = checkpointFor(sessionFile(sid), sid, call.id, version, options.contextId);
+                    if (checkpoint !== undefined && (call.name !== "compress" || next.isError !== true)) {
+                        next = { ...next, details: { ...next.details, [CHECKPOINT_KEY]: checkpoint } };
+                    }
+                } catch (error) {
+                    // The compression is already made: a checkpoint failure must not fail the tool call.
+                    host.notice("warning", `Could not save the fork checkpoint: ${String(error)}`, sid);
+                }
+            }
+            return next;
+        },
+    } as any);
+
+    const compaction = hook(CompactionTask, {
+        beforeCompact: async (input: any, hookApi: any, context: any) => {
+            const ctx = await contextFor(hookApi, context);
+            for (const result of await fire("session_before_compact", { reason: input.reason }, ctx)) {
+                if ((result as { cancel?: boolean } | undefined)?.cancel === true) return { decline: true as const };
+            }
+            return undefined;
+        },
+    } as any);
+
+    return Object.assign(defineExtension({
+        name: extensionName,
+        tools: durableTools as any,
+        sections: [prompt],
+        hooks: [generation, toolHooks, compaction],
+    }), { prepare });
+}

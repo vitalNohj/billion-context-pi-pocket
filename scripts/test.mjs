@@ -1,0 +1,10 @@
+import { readdir } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { root } from './upstream.mjs';
+const files = (await readdir(join(root, 'test'))).filter((name) => /\.test\.(?:ts|mjs)$/.test(name)).sort().map((name) => join(root, 'test', name));
+if (!files.length) throw new Error('No test files found');
+const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...process.argv.slice(2), ...files], { cwd: root, stdio: 'inherit' });
+if (result.error) throw result.error;
+if (result.signal) process.kill(process.pid, result.signal);
+process.exitCode = result.status ?? 1;

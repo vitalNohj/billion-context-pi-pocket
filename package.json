@@ -9,13 +9,14 @@
     "node": ">=22.19"
   },
   "scripts": {
-    "bundle": "node scripts/bundle.mjs",
-    "verify-bundle": "node scripts/bundle.mjs --check",
+    "pins": "node scripts/pins.mjs",
+    "verify-pins": "node scripts/pins.mjs --check",
     "check-upstream": "node scripts/check-upstream.mjs",
     "refresh": "node scripts/refresh.mjs",
-    "test": "node --test --test-concurrency=1 test/*.test.ts"
+    "test": "node scripts/test.mjs"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
     "@earendil-works/pi-tui": "0.83.0",
     "acp-kernel": "0.0.98",
     "billion-context-pi": "0.1.83",

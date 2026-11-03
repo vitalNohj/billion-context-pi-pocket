@@ -1,385 +1,43 @@
 /**
- * Runs billion-context-pi in Pi Pocket: model-driven context compression (compress, decompress, search_context) that
- * survives forks.
- *
- * billion-context-pi (https://pi.dev/packages/billion-context-pi) is a pi extension: it is written for pi's extension
- * API (`pi.on`, `pi.registerTool`, a session manager). This drop-in gives it that API on top of Pi Durable, for the
- * parts that work without a terminal, and drops the rest:
- *
- * - `context` (the messages of each request) -> `beforeRequest` of the generation task
- * - `before_agent_start` (its system prompt text) -> a prompt section
- * - `registerTool` -> Pi Durable tools
- * - `tool_call` / `tool_result` -> `beforeTool` / `afterTool`
- * - `message_end` -> `afterResponse`
- * - `session_before_compact` -> `beforeCompact` (it declines Pi Durable's compaction: it does its own)
- * - `session_start` -> once per conversation per load, before its first request or tool call
- * - commands, shortcuts, renderers, `input`, `agent_settled`, `appendEntry`, `sendUserMessage`: not available, ignored
- *
- * billion-context-pi runs as a declared "fork host" (PI_ACP_FORK_HOST=1): it reads the messages of each request
- * instead of pi's session file, and keeps its compression state in `<stateDir>/<conversation>.jsonl.acp.json`.
- *
- * Forks: after each compression, an immutable checkpoint of that state is saved in `<stateDir>/checkpoints/`, and
- * its ID goes into the tool result's details (never model-visible). A fork restores the newest checkpoint in the
- * history it inherited, so it starts with exactly the compression made before its fork point. Histories without
- * checkpoints fall back to billion-context-pi's own replay of the compress calls they contain.
- *
- * Settings: `billion-context-pi-pocket.json` next to this file, all optional (see the README).
+ * Billion context for Pi Pocket. The gallery entry contains this integration, not the upstream program.
+ * Only an owner's Install/Update action downloads the reviewed, hash-pinned upstream package.
+ * Per-chat controls and installation use public extension APIs. Pocket itself is not modified.
  */
 import { createHash } from "node:crypto";
-import {
-    existsSync,
-    lstatSync,
-    mkdirSync,
-    readFileSync,
-    readlinkSync,
-    realpathSync,
-    renameSync,
-    writeFileSync,
-} from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
-    AgentDoc,
-    CompactionTask,
-    defineExtension,
-    defineTool,
-    GenerationTask,
-    hook,
-    section,
-    ToolTask,
+    AgentDoc, CompactionTask, defineDoc, defineExtension, defineTool, GenerationTask, hook, LiveDoc, section, ToolTask,
 } from "@earendil-works/pi-durable";
 
-// ---- settings ----
-
-const SETTINGS_FILE = "billion-context-pi-pocket.json";
-/** Read old installations without changing their stored extension name or compression state. */
-const LEGACY_SETTINGS_FILE = "billion-context-pi-pocket-adapter.json";
-/** Updated with the pinned bundle; a refresh is committed only after the tests pass. */
-const TESTED_BCP_VERSIONS = ["0.1.83"];
-/** In tool-result details. Histories made by earlier versions of this adapter carry it: keep it. */
-export const CHECKPOINT_KEY = "pocketBcpCheckpoint";
-
-interface Settings {
-    /** Legacy setting. Ignored: this adapter always runs its own pinned bundle. */
-    billionContextPi?: string;
-    /** Compression state. Relative to Pi Pocket's data folder. Default: "billion-context-pi". */
-    stateDir?: string;
-    /** The Pi Durable extension's name. Conversations store it: keep it once chosen. Default: "billion-context-pi". */
-    extensionName?: string;
-}
-
+export const pocketApi = 1;
 const here = dirname(fileURLToPath(import.meta.url));
-const settingsPath = [SETTINGS_FILE, LEGACY_SETTINGS_FILE]
-    .map((name) => join(here, name))
-    .find((path) => existsSync(path)) ?? join(here, SETTINGS_FILE);
+const files = join(here, "billion-context-pi-pocket");
+const hash = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function readSettings(): Settings {
-    if (!existsSync(settingsPath)) return {};
-    const parsed = JSON.parse(readFileSync(settingsPath, "utf8"));
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error(`${settingsPath} must hold a JSON object`);
-    }
-    for (const key of ["billionContextPi", "stateDir", "extensionName"]) {
-        if (parsed[key] !== undefined && (typeof parsed[key] !== "string" || parsed[key] === "")) {
-            throw new Error(`${settingsPath}: "${key}" must be a non-empty string`);
-        }
-    }
-    return parsed;
+// Version our own helpers as well as upstream imports: reloading an entry must not reuse stale helper code.
+async function ownModule(name: string) {
+    const file = join(files, name);
+    return import(`${pathToFileURL(file).href}?sha256=${hash(readFileSync(file))}`);
 }
+const { RuntimeStore, validatePin, fingerprint } = await ownModule("runtime.mjs");
+const { ContextEpochStore } = await ownModule("context.mjs");
+const bridgeModule = await ownModule("bridge.ts");
+export const CHECKPOINT_KEY = bridgeModule.CHECKPOINT_KEY;
+export const branchEntries = bridgeModule.branchEntries;
+export const decompressToFile = bridgeModule.decompressToFile;
+export const translatePiState = bridgeModule.translatePiState;
+export const importPiState = bridgeModule.importPiState;
 
-const settings = readSettings();
-const extensionName = settings.extensionName ?? "billion-context-pi";
-
-// ---- billion-context-pi ----
-
-const bundleDir = join(here, "billion-context-pi-pocket");
-const bundlePath = join(bundleDir, "bundle.json");
-function missingBundle(): never {
-    throw new Error(
-        `The bundled billion-context-pi is missing at ${bundleDir}. Copy the ` +
-            `billion-context-pi-pocket/ folder together with this extension. No separate pi install is needed.`,
-    );
-}
-if (!existsSync(bundlePath)) missingBundle();
-const bundle = JSON.parse(readFileSync(bundlePath, "utf8"));
-if (bundle.package !== "billion-context-pi" || !/^\d+\.\d+\.\d+$/.test(bundle.version)) {
-    throw new Error(`Invalid billion-context-pi bundle metadata at ${bundlePath}`);
-}
-export const BCP_VERSION: string = bundle.version;
-// Version every import path so a reload cannot reuse the previous runtime's
-// entry or relative child modules from Node's module cache.
-const bcpDir = join(bundleDir, `billion-context-pi-${BCP_VERSION}`);
-const bcpPackagePath = join(bcpDir, "package.json");
-if (!existsSync(bcpPackagePath) || !existsSync(join(bcpDir, "dist", "index.js"))) missingBundle();
-const bcpPackage = JSON.parse(readFileSync(bcpPackagePath, "utf8"));
-if (bcpPackage.name !== "billion-context-pi" || bcpPackage.version !== BCP_VERSION) {
-    throw new Error(`Bundled package metadata does not match billion-context-pi ${BCP_VERSION}`);
-}
-if (settings.billionContextPi !== undefined) {
-    console.warn(`[billion-context-pi-pocket] The legacy billionContextPi setting is ignored; using bundled billion-context-pi ${BCP_VERSION}.`);
-}
-
-// These are process-wide, as in earlier adapters. Set them before importing BCP.
-process.env.PI_ACP_FORK_HOST = "1";
-// A running server must not replace the version its checkpoints were made for.
-// Repository updates, not BCP's runtime npm updater, replace this pinned copy.
-process.env.ACP_AUTO_UPDATE = "0";
-// Host packages resolve normally through Pi Pocket's extensions/node_modules link.
-const bcp = await import(pathToFileURL(join(bcpDir, "dist", "index.js")).href);
-const factory = bcp.default as (pi: unknown) => unknown;
-const deriveChildState = bcp.deriveChildState as ((state: any) => any) | undefined;
-if (typeof factory !== "function" || typeof deriveChildState !== "function") {
-    throw new Error(`billion-context-pi ${BCP_VERSION} at ${bcpDir} lacks the API this extension needs`);
-}
-
-// ---- fork checkpoints ----
-
-// Must match billion-context-pi's messageIdentity/stableLiveId: saved state already uses these IDs.
-const REF_SOURCE = "(?:<acp\\s[^>]*>m\\d{5}</acp>|\\[m\\d{1,5}\\])";
-const LEADING_REF = new RegExp(`^${REF_SOURCE}\\s?\\n?`);
-const TRAILING_REF = new RegExp(`\\n*${REF_SOURCE}\\s*$`);
-const stripRef = (text: string) => text.replace(LEADING_REF, "").replace(TRAILING_REF, "");
-
-function normalize(value: any, message = false): any {
-    if (Array.isArray(value)) {
-        return value.flatMap((item) => {
-            if (item?.type === "text" && typeof item.text === "string") {
-                const stripped = stripRef(item.text);
-                if (item.text !== stripped && stripped === "") return [];
-            }
-            return [normalize(item)];
-        });
-    }
-    if (value === null || typeof value !== "object") return value;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value).sort()) {
-        if (message && key === "timestamp") continue;
-        const item = value[key];
-        if (message && key === "content" && typeof item === "string") {
-            out[key] = [{ text: stripRef(item), type: "text" }];
-        } else if (key === "text" && typeof item === "string" && value.type === "text") {
-            out[key] = stripRef(item);
-        } else {
-            out[key] = normalize(item);
-        }
-    }
-    return out;
-}
-
-/** The untransformed, fork-bounded request history as session entries, with billion-context-pi's stable IDs. */
-export function branchEntries(messages: readonly any[]): any[] {
-    const ranks = new Map<string, number>();
-    return messages.map((message) => {
-        const identity = JSON.stringify(normalize(message, true));
-        const rank = ranks.get(identity) ?? 0;
-        ranks.set(identity, rank + 1);
-        const id = `live-${createHash("sha256").update(`${identity}\0${rank}`).digest("hex").slice(0, 16)}`;
-        return { type: "message", id, parentId: null, timestamp: String(message.timestamp ?? 0), message };
-    });
-}
-
-function readState(file: string): any | undefined {
-    try {
-        const state = JSON.parse(readFileSync(`${file}.acp.json`, "utf8"));
-        if (Array.isArray(state?.blocks)) return state;
-    } catch (error: any) {
-        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-    }
-    return undefined;
-}
-
-/** Immutable, content-addressed objects keep checkpoints out of already-large chat histories. */
-function objectPath(file: string, id: string): string | undefined {
-    if (!/^[a-f0-9]{64}$/.test(id)) return undefined;
-    return join(dirname(file), "checkpoints", `${id}.json`);
-}
-
-function saveObject(file: string, value: unknown): string {
-    const content = JSON.stringify(value);
-    const id = createHash("sha256").update(content).digest("hex");
-    const target = objectPath(file, id)!;
-    if (!existsSync(target)) {
-        mkdirSync(dirname(target), { recursive: true });
-        const temporary = `${target}.${process.pid}.tmp`;
-        writeFileSync(temporary, content, { mode: 0o600 });
-        renameSync(temporary, target);
-    }
-    return id;
-}
-
-function loadObject(file: string, id: unknown): any | undefined {
-    if (typeof id !== "string") return undefined;
-    const target = objectPath(file, id);
-    if (target === undefined) return undefined;
-    try {
-        const content = readFileSync(target, "utf8");
-        if (createHash("sha256").update(content).digest("hex") !== id) return undefined;
-        return JSON.parse(content);
-    } catch (error: any) {
-        if (error.code !== "ENOENT") throw error;
-        return undefined;
-    }
-}
-
-/** The checkpoint for a compress call (or a codemode script that made one): only IDs, no copies of old messages. */
-function checkpointFor(file: string, conversationId: string, callId: string): any | undefined {
-    const state = readState(file);
-    const made = state?.blocks.some(
-        (block: any) => block.compressCallId === callId || block.compressCallId?.startsWith(`${callId}/`),
-    );
-    if (!made) return undefined;
-    // Deduplicate block bodies across checkpoints, and leave out origins (which repeat whole messages).
-    const { liveRefOrigins: _origins, derivedFrom: _parent, blocks, ...snapshot } = state;
-    const blockIds = blocks.map((block: any) => saveObject(file, block));
-    const stateId = saveObject(file, { ...snapshot, blockIds });
-    return { version: 2, bcpVersion: BCP_VERSION, conversationId, stateId };
-}
-
-/** Restore the newest checkpoint in a fork's inherited history; never replace state the fork already has. */
-function restoreCheckpoint(file: string, messages: readonly any[]): string | undefined {
-    if ((readState(file)?.blocks.length ?? 0) > 0) return undefined;
-    // Only checkpoints present at the fork cutoff can be selected.
-    for (let i = messages.length - 1; i >= 0; i--) {
-        const message = messages[i];
-        if (message.role !== "toolResult") continue;
-        const checkpoint = message.details?.[CHECKPOINT_KEY];
-        if (checkpoint?.bcpVersion !== BCP_VERSION) continue;
-        let source: any;
-        if (checkpoint.version === 2) {
-            const manifest = loadObject(file, checkpoint.stateId);
-            if (!Array.isArray(manifest?.blockIds)) continue;
-            const blocks = manifest.blockIds.map((id: unknown) => loadObject(file, id));
-            if (blocks.some((block: any) => typeof block?.blockId !== "string")) continue;
-            const { blockIds: _ids, ...state } = manifest;
-            source = { ...state, blocks };
-        } else if (checkpoint.version === 1) {
-            // The whole state inline, as the first version of this adapter saved it.
-            source = checkpoint.state;
-        } else {
-            continue;
-        }
-        if (
-            !Array.isArray(source?.blocks) ||
-            source.blocks.length === 0 ||
-            !source.messageRefs?.byRaw ||
-            !source.messageRefs?.byRef
-        ) {
-            continue;
-        }
-        const restored = {
-            ...deriveChildState!(source),
-            schemaVersion: source.schemaVersion,
-            producer: source.producer,
-            derivedFrom: { parentSessionId: String(checkpoint.conversationId), derivedAt: Date.now() },
-            liveRefOrigins: [],
-        };
-        const target = `${file}.acp.json`;
-        const temporary = `${target}.fork-${process.pid}`;
-        writeFileSync(temporary, JSON.stringify(restored), { mode: 0o600 });
-        renameSync(temporary, target);
-        return String(checkpoint.conversationId);
-    }
-    return undefined;
-}
-
-// ---- terminal Pi imports ----
-
-type PiImportEntry = { from?: string; id: unknown; message: any };
-
-/** Translate terminal Pi entry IDs without changing the compression refs or the source state. */
-export function translatePiState(
-    state: any,
-    entries: readonly PiImportEntry[],
-): { state: any; mapped: number; total: number } | undefined {
-    if (
-        !Array.isArray(state?.blocks) ||
-        state.blocks.length === 0 ||
-        !state.messageRefs?.byRaw ||
-        !state.messageRefs?.byRef
-    ) {
-        return undefined;
-    }
-    const live = branchEntries(entries.map((entry) => entry.message));
-    // Duplicate-message ranks use the whole copied context and can differ if a later request changes that context.
-    const map = new Map<string, string>();
-    entries.forEach((entry, i) => {
-        if (entry.from !== undefined && !map.has(entry.from)) map.set(entry.from, live[i].id);
-    });
-    const translateId = (id: string): string | undefined => {
-        // Multi-tool-call messages use <entry>#<tool-call>; only the entry part changes between hosts.
-        const hash = id.indexOf("#");
-        const base = hash === -1 ? id : id.slice(0, hash);
-        const liveId = map.get(base);
-        return liveId === undefined ? undefined : liveId + (hash === -1 ? "" : id.slice(hash));
-    };
-    const ids = new Set<string>(state.blocks.flatMap((block: any) => block.effectiveMessageIds));
-    const mapped = [...ids].filter((id) => translateId(id) !== undefined).length;
-    const translateIds = (ids: readonly string[]) => ids.flatMap((id) => {
-        const translated = translateId(id);
-        return translated === undefined ? [] : [translated];
-    });
-    const translated = {
-        ...state,
-        blocks: state.blocks.map((block: any) => ({
-            ...block,
-            effectiveMessageIds: translateIds(block.effectiveMessageIds),
-            directMessageIds: translateIds(block.directMessageIds),
-        })).filter((block: any) => block.effectiveMessageIds.length > 0),
-        messageRefs: {
-            ...state.messageRefs,
-            byRaw: Object.fromEntries(Object.entries(state.messageRefs.byRaw).flatMap(([id, ref]) => {
-                const translated = translateId(id);
-                return translated === undefined ? [] : [[translated, ref]];
-            })),
-            byRef: Object.fromEntries(Object.entries(state.messageRefs.byRef).flatMap(([ref, id]) => {
-                const translated = translateId(id as string);
-                return translated === undefined ? [] : [[ref, translated]];
-            })),
-        },
-        ...(state.lastPassIds === undefined ? {} : { lastPassIds: translateIds(state.lastPassIds) }),
-    };
-    return { state: translated, mapped, total: ids.size };
-}
-
-/** Import a matching terminal sidecar atomically; keep any compression the conversation already has. */
-export function importPiState(
-    companion: string,
-    entries: readonly PiImportEntry[],
-    target: string,
-): { blocks: number; mapped: number; total: number } | undefined {
-    if ((readState(target)?.blocks.length ?? 0) > 0) return undefined;
-    let source: any;
-    try {
-        source = JSON.parse(readFileSync(companion, "utf8"));
-    } catch (error: any) {
-        if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-        return undefined;
-    }
-    const translated = translatePiState(source, entries);
-    if (translated === undefined || translated.total === 0 || translated.mapped / translated.total < 0.9) return undefined;
-    const restored = {
-        ...deriveChildState!(translated.state),
-        schemaVersion: translated.state.schemaVersion,
-        producer: translated.state.producer,
-        derivedFrom: { piSession: companion.slice(0, -".acp.json".length), derivedAt: Date.now() },
-        liveRefOrigins: [],
-    };
-    const file = `${target}.acp.json`;
-    const temporary = `${file}.pi-import-${process.pid}`;
-    writeFileSync(temporary, JSON.stringify(restored), { mode: 0o600 });
-    renameSync(temporary, file);
-    return { blocks: restored.blocks.length, mapped: translated.mapped, total: translated.total };
-}
-
-// ---- the adapter ----
-
-type Level = "info" | "warning" | "error";
-/** The part of Pi Pocket's host this uses. */
+type OffBehavior = "keep-summaries" | "restore-history";
 type Host = {
     dataDir: string;
-    notice(level: Level, message: string, conversationId?: string): void;
+    notice(level: "info" | "warning" | "error", message: string, conversationId?: string): void;
     registerPiSessionCompanion?(companion: {
         suffix: string;
         label: string;
@@ -387,430 +45,402 @@ type Host = {
             conversationId: unknown;
             piFile: string;
             companion: string;
-            entries: readonly PiImportEntry[];
+            entries: readonly { from?: string; id: unknown; message: any }[];
         }): Promise<string | void> | string | void;
     }): () => void;
 };
-type Web = { onDispose(cleanup: () => void): void };
-type Handler = (event: any, ctx: any) => unknown;
-type PiTool = {
-    name: string;
-    description: string;
-    parameters: any;
-    annotations?: Record<string, unknown>;
-    execute(toolCallId: string, params: unknown, signal: unknown, onUpdate: unknown, ctx: any): Promise<any>;
-};
-
-/**
- * Tools that only change what the model sees of the conversation, never files, commands, or anything outside it, so
- * Pocket's plan mode may run them. The delegate tools start subagents and stay blocked there.
- */
+type Pin = { version: string; tarball: string; integrity: string; archiveBytes?: number; unpackedBytes?: number; executableFiles: Record<string, string> };
+type Profile = { enabled: boolean; offBehavior?: OffBehavior };
+const TOOL_NAMES = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
 const CONTEXT_ONLY = new Set(["compress", "search_context", "acp_status", "acp_cache"]);
-
-/** The tool's own annotations, marked read-only when it only changes the model's view (Pocket's plan mode reads it). */
-function annotationsOf(tool: PiTool): { annotations?: Record<string, unknown> } {
-    // A requested export calls Pocket's write tool. Do not promise that this tool is read-only, even when that write
-    // is itself guarded. Pocket currently checks the outer tool before it can make a nested call.
-    if (tool.name === "decompress") {
-        return { annotations: { ...tool.annotations, readOnlyHint: false } };
-    }
-    if (!CONTEXT_ONLY.has(tool.name)) {
-        return tool.annotations === undefined ? {} : { annotations: tool.annotations };
-    }
-    return { annotations: { ...tool.annotations, readOnlyHint: true } };
-}
-
-/**
- * Preserve billion-context-pi 0.1.83's temp/cache destination policy. Adapted from its MIT-licensed
- * src/decompress-tool.ts; the upstream source, version, and license are retained in the bundled runtime.
- * Only Pocket's write tool receives this destination: BCP receives a separate extension-created scratch file.
- */
-function decompressionDestination(targetPath: string): string | { error: string } {
-    const expanded = targetPath.startsWith("~/") ? join(homedir(), targetPath.slice(2)) : targetPath;
-    let checked = resolve(expanded);
-    let probe = checked;
-    const suffix: string[] = [];
-    while (!existsSync(probe) && probe !== dirname(probe)) {
-        suffix.unshift(basename(probe));
-        probe = dirname(probe);
-    }
-    checked = existsSync(probe) ? realpathSync(probe) : probe;
-    for (const part of suffix) {
-        checked = join(checked, part);
-        try {
-            if (lstatSync(checked).isSymbolicLink()) {
-                const target = readlinkSync(checked);
-                checked = isAbsolute(target) ? resolve(target) : resolve(dirname(checked), target);
-            }
-        } catch {
-            // The destination or a parent does not exist yet, just as in the upstream resolver.
+const offBehavior = (value: unknown): value is OffBehavior => value === "keep-summaries" || value === "restore-history";
+const json = (file: string) => JSON.parse(readFileSync(file, "utf8"));
+const lock = json(join(files, "runtime-lock.json"));
+if (lock.format !== 1 || lock.package !== "billion-context-pi" || !Array.isArray(lock.releases)) throw new Error("Invalid runtime lock");
+const pins: Pin[] = lock.releases.map((value: any) => {
+    const base = validatePin(value);
+    if (!value.executableFiles || typeof value.executableFiles !== "object" || Array.isArray(value.executableFiles)) throw new Error("Runtime pin lacks its executable-file manifest");
+    const entries = Object.entries(value.executableFiles) as [string, unknown][];
+    if (!entries.length || entries.length > 512) throw new Error("Invalid executable-file manifest");
+    for (const [name, digest] of entries) {
+        if (name.split("/").some((part) => !part || part === "." || part === "..") || /[\\\x00-\x1f\x7f]/.test(name)
+            || (name !== "package.json" && !/\.(?:js|mjs|cjs)$/.test(name)) || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+            throw new Error("Invalid executable-file pin");
         }
     }
-    const allowed = [tmpdir(), join(homedir(), ".cache", "opencode"), join(homedir(), ".cache", "pi")];
-    const permitted = allowed.some((folder) => {
-        let root = folder;
-        try { root = realpathSync(folder); } catch { /* A cache folder need not exist yet. */ }
-        const path = relative(root, checked);
-        return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+    if (!value.executableFiles["package.json"] || !value.executableFiles["dist/index.js"]) throw new Error("Incomplete runtime pin");
+    return Object.freeze({ ...base, executableFiles: Object.freeze({ ...value.executableFiles }) });
+});
+if (new Set(pins.map((pin) => pin.version)).size !== pins.length) throw new Error("Duplicate runtime version");
+const currentPin = pins.find((pin) => pin.version === lock.current);
+if (!currentPin) throw new Error("Current runtime version is not reviewed");
+export const BCP_VERSION: string = currentPin.version;
+const contract = json(join(files, "tool-contract.json"));
+if (contract.format !== 1 || contract.package !== "billion-context-pi" || contract.version !== BCP_VERSION
+    || JSON.stringify(contract.tools?.map((tool: any) => tool.name)) !== JSON.stringify(TOOL_NAMES)
+    || contract.tools.some((tool: any) => typeof tool.description !== "string" || !tool.parameters || typeof tool.parameters !== "object")) {
+    throw new Error("Invalid reviewed tool contract");
+}
+const settingsPath = ["billion-context-pi-pocket.json", "billion-context-pi-pocket-adapter.json"]
+    .map((name) => join(here, name)).find((file) => existsSync(file));
+const settings = settingsPath === undefined ? {} : json(settingsPath);
+if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error("Invalid billion-context-pi-pocket settings");
+for (const name of ["stateDir", "extensionName", "billionContextPi"]) {
+    if (settings[name] !== undefined && (typeof settings[name] !== "string" || !settings[name] || settings[name].includes("\0"))) throw new Error(`Invalid ${name}`);
+}
+if (settings.offBehavior !== undefined && !offBehavior(settings.offBehavior)) throw new Error("Invalid offBehavior setting");
+
+function preferences(module = "billion-context-pi-pocket") {
+    return defineDoc<Profile>({
+        kind: `x.${module}.session`, version: 1, scope: "conversation", history: "rewindable", fork: "asOf",
+        initial: () => ({ enabled: true }), checkpointWhen: () => true,
     });
-    return permitted ? checked : {
-        error: `Error: toFile path must be under ${tmpdir()}, ~/.cache/opencode, or ~/.cache/pi. Got: ${targetPath}`,
-    };
 }
+export const SessionPrefs = preferences();
+const executeFile = promisify(execFile);
 
-/**
- * A requested export remains one decompress call to the model. BCP restores into our scratch file; the actual
- * destination is written only by a nested Pocket write call, so its guards, approvals, and wrappers still apply.
- * Automatic output and inline decompression do not use this path and keep upstream behavior.
- */
-export async function decompressToFile(
-    tool: PiTool,
-    args: Record<string, unknown> & { toFile: string },
-    toolApi: any,
-    context: any,
-    ctx: any,
-): Promise<any> {
-    const destination = decompressionDestination(args.toFile);
-    const failure = (text: string) => ({ isError: true, content: [{ type: "text", text }] });
-    if (typeof destination !== "string") return failure(destination.error);
-    if (typeof toolApi.executeTool !== "function") {
-        return failure("Cannot save decompressed text: this Pocket version has no guarded nested tool execution. No destination file was written.");
-    }
-    const scratch = await mkdtemp(join(tmpdir(), "billion-context-pi-pocket-decompress-"));
-    const file = join(scratch, "restored.txt");
+/** Validate before activation without retaining an imported staging path or changing the user's Pi home. */
+async function validateRuntime(directory: string, pin: Pin, signal?: AbortSignal) {
+    const home = await mkdtemp(join(tmpdir(), "bcp-runtime-check-"));
     try {
-        const result = await tool.execute(
-            toolApi.callId, { ...args, toFile: file }, context.abortSignal, undefined, ctx,
-        );
-        if (result?.isError === true) return result;
-        let content: string;
-        try {
-            content = await readFile(file, "utf8");
-        } catch (error: any) {
-            // Invalid refs, missing blocks, and refused runtimes return explanatory text without creating a file.
-            if (error.code === "ENOENT") return result;
-            throw error;
-        }
-        // Pocket's codemode can forward one parent's executeTool API to several calls. Include this call's ID so
-        // exports in the same script never reuse a durable nested-call key with different paths or content.
-        const key = `decompressed-file-${createHash("sha256").update(toolApi.callId).digest("hex")}`;
-        const written = await toolApi.executeTool(
-            "write", { path: destination, content }, context, { key },
-        );
-        if (written.isError) {
-            const reason = written.diagnostics?.map((item: any) => item.message).filter(Boolean).join("\n")
-                || (typeof written.structuredOutput === "string" ? written.structuredOutput : "Pocket's write tool did not save the file.");
-            return failure(`Could not save decompressed text to ${destination}.\n${reason}`);
-        }
-        return {
-            ...result,
-            content: result.content?.map((part: any) => part.type === "text"
-                ? { ...part, text: part.text.replace(file, () => destination) }
-                : part),
-        };
-    } finally {
-        await rm(scratch, { recursive: true, force: true }).catch((error) => {
-            ctx.ui.notify(`Could not remove decompression scratch folder ${scratch}: ${String(error)}`, "warning");
+        await executeFile(process.execPath, [join(files, "verify-runtime.mjs"), directory, pin.version], {
+            cwd: home, timeout: 30_000, maxBuffer: 256 * 1024, signal,
+            env: {
+                PATH: process.env.PATH ?? "", HOME: home, USERPROFILE: home,
+                XDG_CONFIG_HOME: join(home, "config"), XDG_CACHE_HOME: join(home, "cache"),
+                PI_ACP_FORK_HOST: "1", ACP_AUTO_UPDATE: "0",
+                ...(process.env.SYSTEMROOT ? { SYSTEMROOT: process.env.SYSTEMROOT } : {}),
+                ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
+                TEMP: home, TMP: home,
+            },
         });
+    } finally { await rm(home, { recursive: true, force: true }); }
+}
+
+/** Locate a provided ESM package without require.resolve(), which rejects import-only exports. */
+function providedSdk(entryDirectory: string, nodeModules: string) {
+    const expected = realpathSync(join(nodeModules, "@earendil-works/pi-coding-agent"));
+    let directory = realpathSync(entryDirectory);
+    for (;;) {
+        if (basename(directory) !== "node_modules") {
+            const candidate = join(directory, "node_modules/@earendil-works/pi-coding-agent");
+            if (existsSync(candidate)) {
+                if (realpathSync(candidate) !== expected) throw new Error("Legacy runtime must use Pocket's provided packages");
+                return;
+            }
+        }
+        const parent = dirname(directory);
+        if (parent === directory) throw new Error("Legacy runtime cannot resolve Pocket's provided packages");
+        directory = parent;
     }
 }
 
-/** A value that survives JSON (Pi Durable stores details as JSON). */
-function json(value: unknown): any {
-    if (value === undefined) return undefined;
-    try {
-        return JSON.parse(JSON.stringify(value));
-    } catch {
-        return undefined;
+/** No network, copying, npm, or fallback to unverified external dependencies. */
+function legacyPackage(nodeModules: string) {
+    for (const pin of [currentPin!, ...pins.filter((pin) => pin !== currentPin)]) {
+        const directory = join(files, `billion-context-pi-${pin.version}`);
+        if (!existsSync(directory)) continue;
+        if (lstatSync(directory).isSymbolicLink()) throw new Error("Legacy runtime directory must not be a link");
+        for (const [name, digest] of Object.entries(pin.executableFiles)) {
+            const file = join(directory, name);
+            const actual = realpathSync(file);
+            const inside = relative(realpathSync(directory), actual);
+            if (!inside || inside.startsWith("..") || isAbsolute(inside) || lstatSync(file).isSymbolicLink()
+                || hash(readFileSync(actual)) !== digest) throw new Error(`Legacy runtime failed verification: ${name}`);
+        }
+        const metadata = json(join(directory, "package.json"));
+        if (metadata.name !== "billion-context-pi" || metadata.version !== pin.version) throw new Error("Legacy runtime identity mismatch");
+        providedSdk(join(directory, "dist"), nodeModules);
+        return { state: "legacy", installed: true, managed: false, version: pin.version, fingerprint: fingerprint(pin), packageDir: directory, busy: false };
     }
+    return undefined;
 }
 
-/** Pi Pocket calls this synchronously: everything asynchronous happens at import or in the hooks. */
-export default function createBillionContextPiPocket(host: Host, web?: Web) {
-    const stateDir = isAbsolute(settings.stateDir ?? "")
-        ? settings.stateDir!
-        : join(host.dataDir, settings.stateDir ?? "billion-context-pi");
-    mkdirSync(stateDir, { recursive: true });
-    if (!TESTED_BCP_VERSIONS.includes(BCP_VERSION)) {
-        host.notice(
-            "warning",
-            `${extensionName}: billion-context-pi ${BCP_VERSION} is untested with this extension (tested: ${TESTED_BCP_VERSIONS.join(", ")}).`,
-        );
-    }
+function statePath(stateDir: string, id: unknown, epoch = 0) {
+    return join(stateDir, `${id}${epoch === 0 ? "" : `.context-${epoch}`}.jsonl.acp.json`);
+}
+function savedState(stateDir: string, id: unknown, epoch = 0) {
+    const file = statePath(stateDir, id, epoch);
+    try { return json(file); } catch (error: any) { if (error.code === "ENOENT") return undefined; throw error; }
+}
+function activeStateFits(state: any, messages: readonly any[]) {
+    const present = new Set(branchEntries(messages).map((entry: any) => entry.id));
+    return !state?.blocks?.some((block: any) => block.active && (!Array.isArray(block.effectiveMessageIds)
+        || block.effectiveMessageIds.some((id: string) => !present.has(id.split("#", 1)[0]))));
+}
 
-    const handlers = new Map<string, Handler[]>();
-    const tools: PiTool[] = [];
-    const ignored = new Set<string>();
-    const pi: Record<string, unknown> = {
-        on(event: string, handler: Handler) {
-            handlers.set(event, [...(handlers.get(event) ?? []), handler]);
-        },
-        registerTool(tool: PiTool) {
-            if (!tools.some((t) => t.name === tool.name)) tools.push(tool);
-        },
-        events: { on: () => () => {}, emit: () => {} },
+/** Remove appended BCP action notices while paused, never the summaries within the history. */
+export function withoutNewNudges(messages: readonly any[], original: readonly any[]) {
+    const identities = new Set(original.map((message) => branchEntries([message])[0]?.id).filter(Boolean));
+    const lastOriginal = messages.findLastIndex((message) => identities.has(branchEntries([message])[0]?.id));
+    if (lastOriginal < 0) return messages;
+    const timestamps = new Set(original.filter((message) => message.role === "user").map((message) => message.timestamp));
+    return messages.filter((message, index) => index <= lastOriginal || !(message.role === "user" && typeof message.timestamp === "number"
+        && !timestamps.has(message.timestamp) && Array.isArray(message.content) && message.content.length === 1
+        && message.content[0]?.type === "text"));
+}
+const withPrompt = (messages: readonly any[], text: string | undefined) => text
+    ? [{ role: "system", content: text }, ...messages] : messages;
+
+export default function billionContextPiPocket(host: Host, web?: any) {
+    const extensionName = settings.extensionName ?? "billion-context-pi";
+    const stateDir = isAbsolute(settings.stateDir ?? "") ? settings.stateDir : join(host.dataDir, settings.stateDir ?? "billion-context-pi");
+    const root = join(realpathSync(host.dataDir), "billion-context-pi-pocket-runtime");
+    for (const directory of ["packages", "archives"]) {
+        const overlap = relative(join(root, directory), resolve(stateDir));
+        if (overlap === "" || (!overlap.startsWith("..") && !isAbsolute(overlap))) throw new Error("ACP state must not be inside installed program files");
+    }
+    const store = new RuntimeStore({ root, nodeModules: join(here, "node_modules") });
+    const epochs = new ContextEpochStore(join(root, "contexts"));
+    const Prefs = web?.module && web.module !== "billion-context-pi-pocket" ? preferences(web.module) : SessionPrefs;
+    const modules = new Map<string, Promise<any>>();
+    const kernels = new Map<string, any>();
+    let legacy: any | false | undefined;
+    const defaultBehavior = (): OffBehavior => {
+        const value = web?.setting?.("offBehavior") ?? settings.offBehavior ?? "restore-history";
+        return offBehavior(value) ? value : "restore-history";
     };
-    const api = new Proxy(pi, {
-        get(target, key) {
-            if (typeof key !== "string") return undefined;
-            if (key in target) return target[key];
-            // registerCommand, registerShortcut, registerEntryRenderer, appendEntry, sendUserMessage, ...
-            return () => {
-                if (ignored.has(key)) return;
-                ignored.add(key);
-                console.log(`[${extensionName}] pi API "${key}" is not available in Pi Pocket: ignored`);
-            };
-        },
-        // billion-context-pi checks `typeof pi.appendEntry === "function"` and the like: report only what works.
-        has: (target, key) => key in target,
-    });
-
-    factory(api);
-
-    // ---- per-conversation pi context ----
-
-    const started = new Map<string, Promise<void>>();
-    const branches = new Map<string, any[]>();
-    const prepared = new Set<string>();
-
-    function sessionFile(conversationId: string): string {
-        const file = join(stateDir, `${conversationId}.jsonl`);
-        if (!existsSync(file)) writeFileSync(file, "");
-        return file;
+    async function profile(read: any, id: any, context: any) {
+        const value = await read.snapshot(Prefs, id, context);
+        return { enabled: value?.enabled !== false, offBehavior: offBehavior(value?.offBehavior) ? value.offBehavior : defaultBehavior(),
+            usesDefaultOffBehavior: !offBehavior(value?.offBehavior) };
     }
-
-    /** `conversationId` is Pi Durable's own ID: passed unchanged to Pi Durable, as a string to billion-context-pi. */
-    async function modelOf(read: any, models: any, conversationId: unknown, context: unknown) {
-        const agent = await read.snapshot(AgentDoc, conversationId, context);
-        const ref = agent?.model as { provider: string; modelId: string } | undefined;
-        const cwd = agent?.cwd as string | undefined;
-        return { cwd, model: ref === undefined ? undefined : models.getModel(ref.provider, ref.modelId) };
+    async function selected() {
+        const choice = await store.selection();
+        if (choice?.state === "uninstalled") return { state: "uninstalled", installed: false, busy: false };
+        if (choice?.state === "installed") return choice;
+        // Existing bundled installations can keep working until an explicit owner installation.
+        if (legacy === undefined) legacy = legacyPackage(join(here, "node_modules")) ?? false;
+        return legacy || { state: "absent", installed: false, busy: false };
     }
-
-    function ctxFor(conversationId: string, model: unknown, cwd: string | undefined) {
-        const file = sessionFile(conversationId);
-        const branch = () => branches.get(conversationId) ?? [];
-        const notify = (message: string, level?: string) =>
-            host.notice(
-                level === "error" ? "error" : level === "warning" ? "warning" : "info",
-                String(message),
-                conversationId,
-            );
-        return {
-            cwd: cwd ?? process.cwd(),
-            model,
-            mode: "rpc",
-            hasUI: false,
-            ui: new Proxy({ notify } as Record<string, unknown>, {
-                get: (target, key) => (typeof key === "string" && key in target ? target[key] : () => undefined),
-            }),
-            sessionManager: {
-                getSessionId: () => conversationId,
-                getSessionFile: () => file,
-                getCwd: () => cwd ?? process.cwd(),
-                // The request's own history, already bounded by Pi Durable's fork cutoff.
-                getBranch: branch,
-                getEntries: branch,
-                getEntry: (id: string) => branch().find((entry) => entry.id === id),
-                getHeader: () => undefined,
-                getLeafId: () => branch().at(-1)?.id ?? null,
-            },
-            getSystemPrompt: () => "",
-            abort: () => {},
-            isIdle: () => false,
-        };
-    }
-
-    async function fire(event: string, payload: Record<string, unknown>, ctx: unknown): Promise<unknown[]> {
-        const results: unknown[] = [];
-        for (const handler of handlers.get(event) ?? []) {
-            results.push(await handler({ type: event, ...payload }, ctx));
+    async function runtime() {
+        const choice = await selected();
+        if (choice.state === "absent" || choice.state === "uninstalled") return undefined;
+        const key = `${choice.state}:${choice.fingerprint}`;
+        if (!modules.has(key)) {
+            modules.set(key, (async () => {
+                const value = choice.state === "legacy" ? legacyPackage(join(here, "node_modules")) : await store.resolve(pins);
+                if (!value?.installed) throw new Error("Runtime selection changed; retry the request");
+                process.env.PI_ACP_FORK_HOST = "1";
+                process.env.ACP_AUTO_UPDATE = "0";
+                const module = await import(pathToFileURL(join(value.packageDir, "dist/index.js")).href);
+                if (typeof module.default !== "function" || typeof module.deriveChildState !== "function") throw new Error("Installed BCP lacks the integration API");
+                return { ...value, key, module };
+            })().catch((error) => { modules.delete(key); throw error; }));
         }
-        return results;
+        return modules.get(key);
     }
-
-    /** `session_start` once per conversation for this load of the module (a restart or reload starts again). */
-    function start(conversationId: string, ctx: unknown): Promise<void> {
-        let done = started.get(conversationId);
-        if (done === undefined) {
-            done = fire("session_start", { reason: "startup" }, ctx).then(() => undefined);
-            started.set(conversationId, done);
+    async function kernel(id: any, api: any, context: any, messages?: readonly any[], fresh = false) {
+        const sid = String(id);
+        const boundary = await epochs.read(sid);
+        const choice = await selected();
+        if (choice.state === "uninstalled" || choice.state === "absent") return undefined;
+        const previous = kernels.get(sid);
+        if (!fresh && messages === undefined && previous?.options.epoch === boundary.epoch) return previous;
+        const value = await runtime();
+        if (!value) return undefined;
+        const key = `${value.key}:${boundary.epoch}`;
+        let result = kernels.get(sid);
+        if (result?.key !== key) {
+            const options = { stateDir, extensionName, epoch: boundary.epoch, contextId: boundary.head };
+            const extension = bridgeModule.createBridge(host, value.module, value.version, options);
+            result = { key, options, extension, generation: extension.hooks.find((item: any) => item.handlers.beforeRequest).handlers,
+                tools: extension.hooks.find((item: any) => item.handlers.beforeTool).handlers,
+                compaction: extension.hooks.find((item: any) => item.handlers.beforeCompact).handlers };
+            if (JSON.stringify(extension.tools.map((tool: any) => tool.name)) !== JSON.stringify(TOOL_NAMES)) throw new Error("Upstream tools differ from the reviewed contract; check its global enabled setting");
+            kernels.set(sid, result);
         }
-        return done;
+        result.options.contextId = boundary.head;
+        return result;
     }
-
-    async function contextFor(hookApi: any, context: unknown) {
-        const { model, cwd } = await modelOf(hookApi, hookApi.models, hookApi.conversationId, context);
-        const ctx = ctxFor(String(hookApi.conversationId), model, cwd);
-        await start(String(hookApi.conversationId), ctx);
-        return ctx;
+    async function protectMissingRuntime(id: any) {
+        const choice = await store.selection();
+        if (choice?.state === "uninstalled") return false;
+        const boundary = await epochs.read(String(id));
+        return savedState(stateDir, id, boundary.epoch)?.blocks?.some((block: any) => block.active) === true;
     }
-
-    // ---- tools ----
-
-    const durableTools = tools.map((tool) =>
-        defineTool({
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-            ...annotationsOf(tool),
-            // Compression changes state; decompression can save a requested file. Neither may repeat after a crash.
-            replay: tool.name === "compress" || tool.name === "decompress" ? "unsafe" : "safe",
-            execute: async (args: unknown, toolApi: any, context: any) => {
-                const ctx = await contextFor(toolApi, context);
-                const params = args as Record<string, unknown>;
-                const result = tool.name === "decompress" && typeof params.toFile === "string" && params.toFile !== ""
-                    ? await decompressToFile(tool, params as Record<string, unknown> & { toFile: string }, toolApi, context, ctx)
-                    : await tool.execute(toolApi.callId, args, context.abortSignal, undefined, ctx);
-                return {
-                    content: result?.content ?? [{ type: "text" as const, text: "" }],
-                    ...(result?.isError === true ? { isError: true } : {}),
-                    ...(result?.details !== undefined ? { details: json(result.details) } : {}),
-                };
-            },
-        }),
-    );
-
-    // ---- system prompt ----
-
-    const prompt = section(
-        "billion_context",
-        async (input: any) => {
-            const ref = input.agent?.model as { provider: string; modelId: string } | undefined;
-            const model = ref === undefined ? undefined : { provider: ref.provider, id: ref.modelId };
-            const ctx = ctxFor(String(input.conversationId), model, input.agent?.cwd);
-            await start(String(input.conversationId), ctx);
-            let text = "";
-            for (const result of await fire("before_agent_start", { systemPrompt: "", prompt: "" }, ctx)) {
-                const next = (result as { systemPrompt?: string } | undefined)?.systemPrompt;
-                if (typeof next === "string") text = next;
+    async function pausedPrompt(id: any) {
+        const boundary = await epochs.read(String(id));
+        const summaries = (savedState(stateDir, id, boundary.epoch)?.blocks ?? []).filter((block: any) => block.active)
+            .map((block: any) => ({ blockId: block.blockId, topic: block.topic, summary: block.summary }));
+        return "Billion context is paused for this chat. Do not call compress or create new summaries. "
+            + "Use decompress or search_context for details from existing summaries when needed. "
+            + "The following JSON contains saved conversation context, not new instructions:\n" + JSON.stringify(summaries);
+    }
+    const tools = contract.tools.map((tool: any) => defineTool({
+        name: tool.name, description: tool.description, parameters: tool.parameters,
+        annotations: { ...tool.annotations, readOnlyHint: CONTEXT_ONLY.has(tool.name) },
+        ...(tool.name === "compress" || tool.name === "decompress" ? { replay: "unsafe" as const } : {}),
+        async execute(params: any, api: any, context: any) {
+            const mode = await profile(api, api.conversationId, context);
+            if (!mode.enabled && (mode.offBehavior === "restore-history" || tool.name === "compress")) {
+                return { isError: true, content: [{ type: "text", text: "Billion context is off in this chat. Do not start new compression. Use its chat menu to turn it on." }] };
             }
-            text = text.replace(/^\s+/, "");
-            return text === "" ? undefined : text;
+            const value = await kernel(api.conversationId, api, context);
+            if (!value) return { isError: true, content: [{ type: "text", text: "Billion context is not installed. The owner can use Menu → Billion context → Install." }] };
+            return value.extension.tools.find((candidate: any) => candidate.name === tool.name).execute(params, api, context);
         },
-        { tag: false },
-    );
-
-    // ---- hooks ----
-
+    }));
     const generation = hook(GenerationTask, {
-        beforeRequest: async (request: any, hookApi: any, context: any) => {
-            const sid = String(hookApi.conversationId);
-            // Captured before billion-context-pi changes the request: already bounded by Pi Durable's fork cutoff.
-            branches.set(sid, branchEntries(request.messages));
-            if (!prepared.has(sid)) {
-                try {
-                    const source = restoreCheckpoint(sessionFile(sid), request.messages);
-                    if (source !== undefined) {
-                        // session_start makes billion-context-pi read the restored state.
-                        started.delete(sid);
-                        host.notice("info", `Restored compression inherited from session ${source}.`, sid);
-                    }
-                } catch (error) {
-                    host.notice(
-                        "warning",
-                        `Could not restore inherited compression; replaying its compress calls instead: ${String(error)}`,
-                        sid,
-                    );
-                }
-                prepared.add(sid);
+        async beforeRequest(request: any, api: any, context: any) {
+            const mode = await profile(api, api.conversationId, context);
+            // Observe the raw prefix even while off, so native compaction cannot resurrect old BCP checkpoints.
+            const sid = String(api.conversationId);
+            const before = await epochs.read(sid);
+            const firstMessage = request.messages.find((message: any) => message.role !== "system");
+            const first = firstMessage === undefined ? undefined : branchEntries([firstMessage])[0].id;
+            await epochs.observe(sid, first, before.head === undefined && !activeStateFits(savedState(stateDir, sid), request.messages));
+            if (!mode.enabled && mode.offBehavior === "restore-history") return { messages: withPrompt(request.messages,
+                "Billion context is off for this chat. Do not use its compression tools. Pocket manages context normally.") };
+            const value = await kernel(api.conversationId, api, context, request.messages, true);
+            if (!value) {
+                if (mode.enabled && await protectMissingRuntime(api.conversationId)) throw new Error("This chat has saved BCP compression. Install billion-context-pi from its menu before continuing, or switch it off with Restore history.");
+                return { messages: withPrompt(request.messages, "Billion context is not installed. Do not use its tools. The owner can install it through Menu → Billion context.") };
             }
-            const ctx = await contextFor(hookApi, context);
-            let messages = [...request.messages];
-            for (const result of await fire("context", { messages }, ctx)) {
-                const next = (result as { messages?: unknown[] } | undefined)?.messages;
-                if (Array.isArray(next)) messages = next;
-            }
-            return { messages };
+            await value.extension.prepare(request, api, context);
+            const agent = await api.snapshot(AgentDoc, api.conversationId, context);
+            // Render after both context-boundary detection and fork restoration, including paused summary lists.
+            const text = mode.enabled
+                ? await value.extension.sections[0].render({ conversationId: api.conversationId, agent, read: api, shown: {} }, context)
+                : await pausedPrompt(api.conversationId);
+            value.options.systemPrompt = text;
+            const output = await value.generation.beforeRequest(request, api, context);
+            const messages = output?.messages ?? request.messages;
+            return { messages: withPrompt(mode.enabled ? messages : withoutNewNudges(messages, request.messages), text) };
         },
-        afterResponse: async (message: any, hookApi: any, context: any) => {
-            await fire("message_end", { message }, await contextFor(hookApi, context));
+        async afterResponse(response: any, api: any, context: any) {
+            const mode = await profile(api, api.conversationId, context);
+            if (!mode.enabled && mode.offBehavior === "restore-history") return;
+            const value = await kernel(api.conversationId, api, context);
+            return value?.generation.afterResponse?.(response, api, context);
         },
     } as any);
-
     const toolHooks = hook(ToolTask, {
-        beforeTool: async (call: any, hookApi: any, context: any) => {
-            if (!handlers.has("tool_call")) return undefined;
-            const ctx = await contextFor(hookApi, context);
-            const input = json(call.arguments) ?? {};
-            const before = JSON.stringify(input);
-            for (const result of await fire("tool_call", { toolName: call.name, toolCallId: call.id, input }, ctx)) {
-                const r = result as { block?: boolean; reason?: string } | undefined;
-                if (r?.block === true) return { block: r.reason ?? "Blocked by billion-context-pi." };
-            }
-            return JSON.stringify(input) === before ? undefined : { arguments: input };
+        async beforeTool(call: any, api: any, context: any) {
+            const mode = await profile(api, api.conversationId, context);
+            if (!mode.enabled && mode.offBehavior === "restore-history") return;
+            const value = await kernel(api.conversationId, api, context);
+            return value?.tools.beforeTool?.(call, api, context);
         },
-        afterTool: async (call: any, result: any, hookApi: any, context: any) => {
-            const sid = String(hookApi.conversationId);
-            const ctx = await contextFor(hookApi, context);
-            let next = result;
-            const outcomes = await fire(
-                "tool_result",
-                {
-                    toolName: call.name,
-                    toolCallId: call.id,
-                    input: call.arguments,
-                    content: result.content ?? [],
-                    details: result.details,
-                    isError: result.isError === true,
-                },
-                ctx,
-            );
-            for (const outcome of outcomes) {
-                const o = outcome as { content?: unknown; details?: unknown; isError?: boolean } | undefined;
-                if (o === undefined) continue;
-                next = {
-                    ...next,
-                    ...(o.content !== undefined ? { content: o.content } : {}),
-                    ...(o.details !== undefined ? { details: json(o.details) } : {}),
-                    ...(o.isError !== undefined ? { isError: o.isError } : {}),
-                };
-            }
-            // Codemode drops a nested compress's details, so its outer result carries the checkpoint too.
-            if (call.name === "compress" || call.name === "codemode") {
-                try {
-                    const checkpoint = checkpointFor(sessionFile(sid), sid, call.id);
-                    if (checkpoint !== undefined && (call.name !== "compress" || next.isError !== true)) {
-                        next = { ...next, details: { ...next.details, [CHECKPOINT_KEY]: checkpoint } };
-                    }
-                } catch (error) {
-                    // The compression is already made: a checkpoint failure must not fail the tool call.
-                    host.notice("warning", `Could not save the fork checkpoint: ${String(error)}`, sid);
-                }
-            }
-            return next;
+        async afterTool(call: any, result: any, api: any, context: any) {
+            const mode = await profile(api, api.conversationId, context);
+            if (!mode.enabled && mode.offBehavior === "restore-history") return;
+            const value = await kernel(api.conversationId, api, context);
+            return value?.tools.afterTool?.(call, result, api, context);
         },
     } as any);
-
     const compaction = hook(CompactionTask, {
-        beforeCompact: async (input: any, hookApi: any, context: any) => {
-            const ctx = await contextFor(hookApi, context);
-            for (const result of await fire("session_before_compact", { reason: input.reason }, ctx)) {
-                if ((result as { cancel?: boolean } | undefined)?.cancel === true) return { decline: true as const };
-            }
-            return undefined;
+        async beforeCompact(request: any, api: any, context: any) {
+            const mode = await profile(api, api.conversationId, context);
+            if (!mode.enabled && mode.offBehavior === "restore-history") return undefined;
+            const value = await kernel(api.conversationId, api, context);
+            if (!value) return await protectMissingRuntime(api.conversationId) ? { decline: true } : undefined;
+            return value.compaction.beforeCompact(request, api, context);
         },
     } as any);
+    // Clear the historical persisted BCP section. Its current text is supplied in beforeRequest,
+    // after the raw prefix is known. Prompt sections expose document reads, not the current history.
+    const prompt = section("billion_context", () => undefined, { tag: false });
 
-    const extension = defineExtension({
-        name: extensionName,
-        tools: durableTools as any,
-        sections: [prompt],
-        hooks: [generation, toolHooks, compaction],
-    });
+    if (web) {
+        if (typeof web.conversationRoute !== "function" || typeof web.settings !== "function") throw new Error("Billion context requires Pi Pocket 0.27.0 or newer");
+        web.settings([{ name: "offBehavior", label: "Default behavior when switched off", type: "choice",
+            default: settings.offBehavior ?? "restore-history", description: "Each chat can override this. Restoring history hands context management back to Pocket on its next request.",
+            choices: [{ value: "restore-history", label: "Restore original history — use Pocket compaction" }, { value: "keep-summaries", label: "Keep existing summaries — stop new compression" }] }]);
+        web.client("billion-context-pi-pocket");
+        const changed = () => web.send("changed", {});
+        web.onSettings?.(changed);
+        async function status(request: any, source?: any) {
+            let runtimeInfo: any;
+            try {
+                runtimeInfo = await store.status(pins);
+                if (runtimeInfo.state === "absent") runtimeInfo = legacyPackage(join(here, "node_modules")) ?? runtimeInfo;
+            } catch (error) { runtimeInfo = { state: "error", installed: false, busy: false, error: String(error) }; }
+            const { packageDir: _privatePath, ...visible } = runtimeInfo;
+            let session;
+            if (source !== undefined) {
+                session = { id: source, ...await profile(request, source, request.context) };
+            }
+            return { runtime: { ...visible, managed: runtimeInfo.state === "installed", availableVersion: BCP_VERSION,
+                updateAvailable: runtimeInfo.installed && runtimeInfo.version !== BCP_VERSION,
+                downloadBytes: currentPin!.archiveBytes, diskBytes: currentPin!.unpackedBytes, host: "registry.npmjs.org" },
+                ...(session ? { session } : {}), defaultOffBehavior: defaultBehavior() };
+        }
+        web.route("GET", "status", (request: any) => status(request));
+        web.conversationRoute("GET", "status/:source", (request: any) => status(request, request.conversation.id), { conversation: "source" });
+        web.route("GET", "licenses", () => ({ text: readFileSync(join(files, "THIRD-PARTY-NOTICES.txt"), "utf8") }));
+        web.route("POST", "runtime/install", async (request: any) => {
+            if (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length) throw web.error(400, "Install accepts no version or URL. Update the extension for new reviewed releases.");
+            try {
+                await store.install(currentPin, { signal: request.signal,
+                    validate: (directory: string, pin: Pin) => validateRuntime(directory, pin, request.signal) });
+            } finally { changed(); }
+            return status(request);
+        });
+        web.route("POST", "runtime/repair", async (request: any) => {
+            if (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length) throw web.error(400, "Repair accepts no parameters");
+            try {
+                await store.repair(currentPin, { signal: request.signal,
+                    validate: (directory: string, pin: Pin) => validateRuntime(directory, pin, request.signal) });
+            } finally {
+                // An in-flight tool round keeps its ACP instance. beforeRequest selects the repaired program next turn.
+                modules.clear(); changed();
+            }
+            return status(request);
+        });
+        web.route("POST", "runtime/uninstall", async (request: any) => {
+            if (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length) throw web.error(400, "Uninstall accepts no parameters");
+            try {
+                // Remove verified caches normally; quarantine damaged caches rather than blindly deleting them.
+                try { await store.uninstall(); }
+                catch { await store.uninstall({ recover: true }); }
+            } finally { kernels.clear(); changed(); }
+            return status(request);
+        });
+        web.conversationRoute("POST", "session/:source", async (request: any) => {
+            const body = request.body;
+            if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => key !== "enabled" && key !== "offBehavior")
+                || (body.enabled !== undefined && typeof body.enabled !== "boolean")
+                || (body.offBehavior !== undefined && body.offBehavior !== null && !offBehavior(body.offBehavior)) || !Object.keys(body).length) throw web.error(400, "Expected enabled and/or offBehavior (null restores the default)");
+            const source = request.conversation.id;
+            const live = await request.snapshot(LiveDoc, source, request.context);
+            if (live?.compactions?.length) throw web.error(409, "Wait for Pocket's current compaction to finish before changing this setting.");
+            // Update only supplied fields inside the transaction; concurrent mode edits must never undo Off.
+            await request.commit(async (tx: any) => {
+                const value = await tx.doc(Prefs, source);
+                if (Object.hasOwn(body, "enabled")) value.enabled = body.enabled;
+                if (Object.hasOwn(body, "offBehavior")) {
+                    if (body.offBehavior === null) delete value.offBehavior;
+                    else value.offBehavior = body.offBehavior;
+                }
+            });
+            changed();
+            return status(request, source);
+        }, { conversation: "source" });
+    }
+    // The program must already be installed. Continuing a Pi session never downloads code.
     if (typeof host.registerPiSessionCompanion === "function") {
         const unregister = host.registerPiSessionCompanion({
             suffix: ".acp.json",
             label: "Compression state",
             async continued(input) {
-                const imported = importPiState(input.companion, input.entries, sessionFile(String(input.conversationId)));
-                if (imported !== undefined) return `Imported compression from Pi: ${imported.blocks} blocks.`;
-                if ((readState(input.piFile)?.blocks.length ?? 0) > 0) {
+                const value = await runtime();
+                if (!value) return "Compression state was not imported because billion-context-pi is not installed. Install it from Menu → Billion context before continuing a compressed Pi session. The copied history is still available.";
+                const sid = String(input.conversationId);
+                const boundary = await epochs.read(sid);
+                await mkdir(stateDir, { recursive: true, mode: 0o700 });
+                const target = statePath(stateDir, sid, boundary.epoch).slice(0, -".acp.json".length);
+                const imported = bridgeModule.importPiState(input.companion, input.entries, target, value.module.deriveChildState);
+                if (imported !== undefined) {
+                    kernels.delete(sid);
+                    return `Imported compression from Pi: ${imported.blocks} blocks.`;
+                }
+                if ((bridgeModule.readState(input.piFile)?.blocks.length ?? 0) > 0) {
                     return "Pi's compression state did not match this copy; billion-context-pi replays its compress calls instead.";
                 }
             },
         });
         web?.onDispose(unregister);
     }
-    return extension;
+    return defineExtension({ name: extensionName, tools, sections: [prompt], hooks: [generation, toolHooks, compaction] });
 }

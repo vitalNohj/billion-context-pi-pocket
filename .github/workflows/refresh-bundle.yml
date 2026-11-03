@@ -1,4 +1,4 @@
-name: Refresh bundle
+name: Refresh pins
 
 on:
   schedule:
@@ -86,7 +86,7 @@ jobs:
           test -n "$CPU_SET"
           taskset -c "$CPU_SET" npm ci --ignore-scripts --no-audit --no-fund --prefix "$PI_POCKET_CHECKOUT"
 
-      - name: Check npm and test the refreshed bundle
+      - name: Check npm and test the refreshed pins
         id: refresh
         shell: bash
         run: |
@@ -133,10 +133,10 @@ jobs:
           test -f "$PI_POCKET_CHECKOUT/test/helpers.ts"
           test -f "$PI_POCKET_CHECKOUT/node_modules/@earendil-works/pi-ai/dist/providers/faux.js"
           taskset -c "$CPU_SET" npm test
-          taskset -c "$CPU_SET" npm run verify-bundle
+          taskset -c "$CPU_SET" npm run verify-pins
 
           if [ "$NEEDS_UPDATE" = "true" ]; then
-            git add -A -- .
+            git add -- package.json package-lock.json upstream.json billion-context-pi-pocket/runtime-lock.json billion-context-pi-pocket/tool-contract.json billion-context-pi-pocket/BCP-LICENSE.txt billion-context-pi-pocket/THIRD-PARTY-NOTICES.txt
             if git diff --cached --quiet; then
               echo "Refresh reported an update but produced no tracked changes." >&2
               exit 1
@@ -155,9 +155,56 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  publish:
-    if: ${{ github.ref == 'refs/heads/main' && needs.build.result == 'success' && needs.build.outputs.needs_update == 'true' }}
+  platform:
+    name: Native installer (${{ matrix.os }})
     needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      UV_THREADPOOL_SIZE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact tested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.tested_sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      - name: Download the candidate pin update
+        if: ${{ needs.build.outputs.needs_update == 'true' }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: refresh-patch
+          path: ${{ runner.temp }}/refresh-artifact
+
+      - name: Apply the same candidate tested on Linux
+        if: ${{ needs.build.outputs.needs_update == 'true' }}
+        run: |
+          set -euo pipefail
+          PATCH_FILE="$RUNNER_TEMP/refresh-artifact/refresh.patch"
+          git apply --check --index "$PATCH_FILE"
+          git apply --index "$PATCH_FILE"
+
+      - name: Verify native install, provided packages, and uninstall
+        run: node --test --test-concurrency=1 test/platform-smoke.test.mjs
+
+  publish:
+    if: ${{ github.ref == 'refs/heads/main' && needs.build.result == 'success' && needs.platform.result == 'success' && needs.build.outputs.needs_update == 'true' }}
+    needs: [build, platform]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -174,7 +221,7 @@ jobs:
           name: refresh-patch
           path: ${{ runner.temp }}/refresh-artifact
 
-      - name: Apply, validate, and commit the tested bundle
+      - name: Apply, validate, and commit the tested pins
         shell: bash
         env:
           UPSTREAM_VERSION: ${{ needs.build.outputs.version }}
@@ -200,157 +247,45 @@ jobs:
           git apply --check --index "$PATCH_FILE"
           git apply --index "$PATCH_FILE"
           # Keep copied upstream files byte-for-byte, even if their whitespace changes.
-          git diff --cached --check -- package.json package-lock.json upstream.json billion-context-pi-pocket.ts
+          git diff --cached --check
           if git diff --cached --quiet; then
             echo "The tested patch contains no changes." >&2
             exit 1
           fi
 
-          # Accept only refresh metadata, the tested-version declaration, and regular vendor files.
+          # Validate the tested patch without executing repository code in this write-enabled job.
           node --input-type=module <<'NODE'
           import { execFileSync } from "node:child_process";
-          import { readFileSync, readdirSync } from "node:fs";
-          import { createHash } from "node:crypto";
+          import { readFileSync } from "node:fs";
           import { isDeepStrictEqual } from "node:util";
-
-          const fields = execFileSync("git", ["diff", "--cached", "--raw", "-z", "--no-renames"], { encoding: "utf8" })
-            .split(String.fromCharCode(0));
-          if (fields.at(-1) === "") fields.pop();
-          if (fields.length === 0 || fields.length % 2 !== 0) throw new Error("Invalid staged diff records");
-          const fixedPaths = new Set([
-            "package.json", "package-lock.json", "upstream.json", "billion-context-pi-pocket.ts",
-          ]);
-          const vendorPrefix = "billion-context-pi-pocket/";
-          const vendorRootFiles = new Set(["bundle.json", "THIRD-PARTY-NOTICES.txt"]);
-          const distExtensions = [".js", ".map", ".d.ts", ".json", ".txt"];
+          const fields = execFileSync("git", ["diff", "--cached", "--raw", "-z", "--no-renames"], { encoding: "utf8" }).split("\0");
+          if (fields.pop() !== "" || !fields.length || fields.length % 2) throw new Error("Invalid staged diff");
+          const allowed = new Set(["package.json", "package-lock.json", "upstream.json", "billion-context-pi-pocket/runtime-lock.json", "billion-context-pi-pocket/tool-contract.json", "billion-context-pi-pocket/BCP-LICENSE.txt", "billion-context-pi-pocket/THIRD-PARTY-NOTICES.txt"]);
           for (let i = 0; i < fields.length; i += 2) {
-            if (!fields[i].startsWith(":")) throw new Error("Invalid staged diff header");
-            const header = fields[i].slice(1).split(" ");
-            const path = fields[i + 1];
-            if (header.length !== 5 || !["A", "M", "D"].includes(header[4])) {
-              throw new Error(`Unsupported staged change: ${path}`);
-            }
-            const [oldMode, newMode, _oldHash, _newHash, status] = header;
-            const relative = path.startsWith(vendorPrefix) ? path.slice(vendorPrefix.length) : "";
-            const safeRelative = relative !== ""
-              && !relative.split("/").some((part) => part === "" || part === "." || part === "..");
-            const isVendorRootFile = safeRelative && vendorRootFiles.has(relative);
-            const runtime = /^billion-context-pi-(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\/(.+)$/.exec(relative);
-            const runtimePath = runtime?.[1] ?? "";
-            const isRuntimeRootFile = safeRelative && ["package.json", "LICENSE"].includes(runtimePath);
-            const isDistFile = safeRelative && runtimePath.startsWith("dist/")
-              && distExtensions.some((extension) => runtimePath.endsWith(extension));
-            const isVendorFile = path.startsWith(vendorPrefix) && (isVendorRootFile || isRuntimeRootFile || isDistFile);
-            if (!fixedPaths.has(path) && !isVendorFile) throw new Error(`Refresh changed an unexpected path: ${path}`);
-            if (status === "D" && fixedPaths.has(path)) throw new Error(`Refresh deleted required file: ${path}`);
-            for (const mode of [oldMode, newMode]) {
-              if (mode !== "000000" && mode !== "100644") {
-                throw new Error(`Refresh changed a non-regular or executable file: ${path}`);
-              }
-            }
+            const match = /^:([0-7]{6}) ([0-7]{6}) [a-f0-9]+ [a-f0-9]+ ([AM])$/.exec(fields[i]);
+            if (!allowed.has(fields[i + 1]) || !match || !["000000", "100644"].includes(match[1]) || match[2] !== "100644") throw new Error(`Unexpected staged path or mode: ${fields[i + 1]}`);
           }
-
-          const previousPackage = JSON.parse(execFileSync("git", ["show", "HEAD:package.json"], { encoding: "utf8" }));
-          const currentPackage = JSON.parse(readFileSync("package.json", "utf8"));
-          const previousUpstream = JSON.parse(execFileSync("git", ["show", "HEAD:upstream.json"], { encoding: "utf8" }));
-          const currentUpstream = JSON.parse(readFileSync("upstream.json", "utf8"));
-          const upstreamVersion = process.env.UPSTREAM_VERSION;
-          const stableVersion = (value) => typeof value === "string"
-            && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value);
-          if (!stableVersion(upstreamVersion) || currentUpstream.version !== upstreamVersion
-            || currentPackage.version !== upstreamVersion) {
-            throw new Error("package, upstream metadata, and tested version must agree");
-          }
-          for (const key of new Set([...Object.keys(previousPackage), ...Object.keys(currentPackage)])) {
-            if (!["version", "devDependencies"].includes(key)
-              && !isDeepStrictEqual(previousPackage[key], currentPackage[key])) {
-              throw new Error(`Refresh changed unexpected package.json field: ${key}`);
-            }
-          }
-          const asBundledDependencies = (metadata, label) => {
-            const value = metadata?.bundledDependencies;
-            if (value === null || typeof value !== "object" || Array.isArray(value)) {
-              throw new Error(`${label} bundledDependencies must be an object`);
-            }
-            return value;
-          };
-          const oldBundled = asBundledDependencies(previousUpstream, "Old upstream");
-          const newBundled = asBundledDependencies(currentUpstream, "New upstream");
-          const oldDependencies = previousPackage.devDependencies;
-          const newDependencies = currentPackage.devDependencies;
-          if (oldDependencies === null || typeof oldDependencies !== "object" || Array.isArray(oldDependencies)
-            || newDependencies === null || typeof newDependencies !== "object" || Array.isArray(newDependencies)) {
-            throw new Error("package.json devDependencies must be objects");
-          }
-          const allowedDependencyChanges = new Set([
-            "billion-context-pi", ...Object.keys(oldBundled), ...Object.keys(newBundled),
-          ]);
-          for (const name of new Set([...Object.keys(oldDependencies), ...Object.keys(newDependencies)])) {
-            if (!allowedDependencyChanges.has(name) && !isDeepStrictEqual(oldDependencies[name], newDependencies[name])) {
-              throw new Error(`Refresh changed unexpected devDependency: ${name}`);
-            }
-          }
-          if (newDependencies["billion-context-pi"] !== upstreamVersion) {
-            throw new Error("billion-context-pi devDependency must equal UPSTREAM_VERSION");
-          }
-          for (const [name, metadata] of Object.entries(newBundled)) {
-            if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)
-              || !stableVersion(metadata.version)) {
-              throw new Error(`Bundled dependency has an invalid stable version: ${name}`);
-            }
-            if (newDependencies[name] !== metadata.version) {
-              throw new Error(`package.json devDependency does not match bundled version: ${name}`);
-            }
-          }
-
-          // Verify the exact artifact again without running repository code in this write-enabled job.
-          const manifest = JSON.parse(readFileSync(`${vendorPrefix}bundle.json`, "utf8"));
-          if (manifest.package !== "billion-context-pi" || manifest.version !== upstreamVersion
-            || manifest.runtimeDirectory !== `billion-context-pi-${upstreamVersion}`) {
-            throw new Error("Bundle manifest does not match the tested version");
-          }
-          const walk = (prefix = "") => readdirSync(`${vendorPrefix}${prefix}`, { withFileTypes: true }).flatMap((entry) => {
-            const path = `${prefix}${entry.name}`;
-            if (entry.isDirectory()) return walk(`${path}/`);
-            if (!entry.isFile()) throw new Error(`Non-regular bundled file: ${path}`);
-            return [path];
-          });
-          if (!isDeepStrictEqual(walk().sort(), [...Object.keys(manifest.files), "bundle.json"].sort())) {
-            throw new Error("Bundle file list does not match its manifest");
-          }
-          for (const [path, expected] of Object.entries(manifest.files)) {
-            const content = readFileSync(`${vendorPrefix}${path}`);
-            if (content.length !== expected.bytes || createHash("sha256").update(content).digest("hex") !== expected.sha256) {
-              throw new Error(`Bundle content does not match its manifest: ${path}`);
-            }
-          }
-
-          const beforeAdapter = execFileSync("git", ["show", "HEAD:billion-context-pi-pocket.ts"], { encoding: "utf8" });
-          const afterAdapter = readFileSync("billion-context-pi-pocket.ts", "utf8");
-          const declarationPrefix = "const TESTED_BCP_VERSIONS = ";
-          const newline = String.fromCharCode(10);
-          const carriageReturn = String.fromCharCode(13);
-          const declarationLines = (text) => text.split(newline)
-            .map((line) => line.endsWith(carriageReturn) ? line.slice(0, -1) : line)
-            .filter((line) => line.startsWith(declarationPrefix));
-          const beforeDeclarations = declarationLines(beforeAdapter);
-          const afterDeclarations = declarationLines(afterAdapter);
-          const expectedDeclaration = `${declarationPrefix}${JSON.stringify([process.env.UPSTREAM_VERSION])};`;
-          if (beforeDeclarations.length !== 1 || afterDeclarations.length !== 1 || afterDeclarations[0] !== expectedDeclaration) {
-            throw new Error("Extension must contain exactly the tested TESTED_BCP_VERSIONS declaration");
-          }
-          const normalizeAdapter = (text) => text.split(newline).map((line) => {
-            const content = line.endsWith(carriageReturn) ? line.slice(0, -1) : line;
-            return content.startsWith(declarationPrefix) ? `${declarationPrefix}<tested-versions>;` : line;
-          }).join(newline);
-          if (normalizeAdapter(beforeAdapter) !== normalizeAdapter(afterAdapter)) {
-            throw new Error("Refresh changed extension code outside TESTED_BCP_VERSIONS");
-          }
+          const previous = JSON.parse(execFileSync("git", ["show", "HEAD:package.json"], { encoding: "utf8" }));
+          const current = JSON.parse(readFileSync("package.json", "utf8"));
+          const upstream = JSON.parse(readFileSync("upstream.json", "utf8"));
+          const lock = JSON.parse(readFileSync("billion-context-pi-pocket/runtime-lock.json", "utf8"));
+          const oldLock = JSON.parse(execFileSync("git", ["show", "HEAD:billion-context-pi-pocket/runtime-lock.json"], { encoding: "utf8" }));
+          const contract = JSON.parse(readFileSync("billion-context-pi-pocket/tool-contract.json", "utf8"));
+          const version = process.env.UPSTREAM_VERSION;
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || current.version !== version || upstream.version !== version || current.devDependencies["billion-context-pi"] !== version || lock.current !== version || contract.version !== version || lock.format !== 1 || lock.package !== "billion-context-pi" || contract.format !== 1 || contract.package !== "billion-context-pi") throw new Error("Version or format mismatch");
+          for (const key of new Set([...Object.keys(previous), ...Object.keys(current)])) if (!["version", "devDependencies"].includes(key) && !isDeepStrictEqual(previous[key], current[key])) throw new Error(`Unexpected package field: ${key}`);
+          const oldUpstream = JSON.parse(execFileSync("git", ["show", "HEAD:upstream.json"], { encoding: "utf8" }));
+          const allowedDeps = new Set(["billion-context-pi", ...Object.keys(oldUpstream.bundledDependencies), ...Object.keys(upstream.bundledDependencies)]);
+          for (const name of new Set([...Object.keys(previous.devDependencies), ...Object.keys(current.devDependencies)])) if (!allowedDeps.has(name) && !isDeepStrictEqual(previous.devDependencies[name], current.devDependencies[name])) throw new Error(`Unexpected dependency change: ${name}`);
+          for (const [name, entry] of Object.entries(upstream.bundledDependencies)) if (current.devDependencies[name] !== entry.version) throw new Error(`Dependency mismatch: ${name}`);
+          if (!Array.isArray(lock.releases) || !Array.isArray(oldLock.releases) || oldLock.releases.some((p) => !lock.releases.some((q) => isDeepStrictEqual(p, q))) || new Set(lock.releases.map((p) => p.version)).size !== lock.releases.length) throw new Error("Reviewed pins changed or disappeared");
+          const pin = lock.releases.find((p) => p.version === version);
+          if (!pin || pin.integrity !== upstream.npmIntegrity || pin.tarball !== `https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-${version}.tgz`) throw new Error("Current pin mismatch");
           NODE
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Refresh billion-context-pi bundle to $UPSTREAM_VERSION"
+          git commit -m "Refresh billion-context-pi pins to $UPSTREAM_VERSION"
           REMOTE_SHA="$(git ls-remote origin refs/heads/main | cut -f1)"
           if [ "$REMOTE_SHA" != "$TESTED_SHA" ]; then
             echo "main changed before publish. Stop; the next scheduled run can retest it." >&2
@@ -359,8 +294,8 @@ jobs:
           git push origin HEAD:refs/heads/main
 
   report-failure:
-    if: ${{ always() && (needs.build.result == 'failure' || needs.publish.result == 'failure') && github.ref == 'refs/heads/main' }}
-    needs: [build, publish]
+    if: ${{ always() && (needs.build.result == 'failure' || needs.platform.result == 'failure' || needs.publish.result == 'failure') && github.ref == 'refs/heads/main' }}
+    needs: [build, platform, publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -370,13 +305,13 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_TITLE: Automated bundle refresh failed
+          ISSUE_TITLE: Automated pin refresh failed
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           ISSUE_NUMBER="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
             | jq -rs --arg title "$ISSUE_TITLE" '[.[][] | select(.title == $title and .pull_request == null) | .number] | first // empty')"
-          ISSUE_BODY="The automated bundle refresh failed. Review the run: ${RUN_URL}"
+          ISSUE_BODY="The automated pin refresh failed. Review the run: ${RUN_URL}"
           if [ -n "$ISSUE_NUMBER" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" --field "body=${ISSUE_BODY}" >/dev/null
             printf 'Updated refresh failure issue #%s.\n' "$ISSUE_NUMBER"

@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "package": "billion-context-pi",
+  "current": "0.1.83",
+  "releases": [
+    {
+      "version": "0.1.83",
+      "tarball": "https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-0.1.83.tgz",
+      "integrity": "sha512-122CcPmZvC5Yqqbj75UMppOFlkdAN8kbzvJ4OugV6xBPW6wbiHbaZ9YDYWQwDy4hJ/Vc98eOREGkWLWKflbnZw==",
+      "archiveBytes": 964679,
+      "unpackedBytes": 4015065,
+      "executableFiles": {
+        "dist/chunk-LLFL3CNI.js": "588c3032520dc212e602fb5225fd3d0994a677c7bda43a3e19315f478753e19c",
+        "dist/contract.js": "72e8b00f4b2c9e746d4479b72be5c54ad898e5320840c7ec6493b272feb1adb2",
+        "dist/index.js": "386de06a8272913a90088d9d219d7abefaed9d46529f7d102435a5a3d094bba0",
+        "package.json": "ec42091501ccc90f76155cf68b17c1ad9338405a3aca4896f713aa1b70fcfd1e"
+      }
+    }
+  ]
+}

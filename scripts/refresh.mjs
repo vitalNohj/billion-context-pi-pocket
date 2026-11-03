@@ -1,12 +1,13 @@
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { bundledPackageNames, licenseFile } from "./bundle-lib.mjs";
-import { fetchJSON, json, npm, release, repository, root, stableVersion } from "./upstream.mjs";
+import { fetchJSON, isNewer, json, npm, release, repository, root, stableVersion } from "./upstream.mjs";
 
 const args = process.argv.slice(2);
 if (args.length !== 1) throw new Error("Usage: npm run refresh -- <stable-version>");
 const version = stableVersion(args[0]);
 const previous = await json(join(root, "upstream.json"));
+if (version !== previous.version && !isNewer(version, previous.version)) throw new Error("Refusing to downgrade the current reviewed release");
 const metadata = await release(version);
 const sourceBase = `https://raw.githubusercontent.com/${repository}/${metadata.gitHead}`;
 const source = await fetchJSON(`${sourceBase}/package.json`);
@@ -75,10 +76,5 @@ await writeFile(join(root, "upstream.json"), JSON.stringify({
     extraLicenses,
 }, null, 2) + "\n");
 
-const adapter = join(root, "billion-context-pi-pocket.ts");
-const code = await readFile(adapter, "utf8");
-const pattern = /const TESTED_BCP_VERSIONS = \[[^\]\n]*\];/g;
-if ([...code.matchAll(pattern)].length !== 1) throw new Error("Cannot find the one TESTED_BCP_VERSIONS declaration");
-await writeFile(adapter, code.replace(pattern, `const TESTED_BCP_VERSIONS = [${JSON.stringify(version)}];`));
-npm(["run", "bundle"]);
+npm(["run", "pins"]);
 console.log(`Prepared ${version}. Run the tests before committing this refresh.`);

@@ -6,8 +6,10 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-// Import the real adapter and bundled deriveChildState without a Pocket checkout. These host-only exports are
-// unused by the pure import helpers; the terminal session manager is likewise unused in fork-host mode.
+// Import the pure bridge and exact development npm runtime without a Pocket checkout or an installed program.
+// These host-only exports and the terminal session manager are unused by the import helpers in fork-host mode.
+process.env.PI_ACP_FORK_HOST = "1";
+process.env.ACP_AUTO_UPDATE = "0";
 const stubs = new Map([
     ["@earendil-works/pi-durable", `export const AgentDoc = null, CompactionTask = null, defineExtension = null,
         defineTool = null, GenerationTask = null, hook = null, section = null, ToolTask = null;`],
@@ -21,13 +23,17 @@ const loader = registerHooks({
             : { url: `data:text/javascript,${encodeURIComponent(source)}`, shortCircuit: true };
     },
 });
-let mod: typeof import("../billion-context-pi-pocket.ts");
+let mod: typeof import("../billion-context-pi-pocket/bridge.ts");
+let deriveChildState: (state: any) => any;
 try {
-    mod = await import(pathToFileURL(resolve(import.meta.dirname, "../billion-context-pi-pocket.ts")).href);
+    mod = await import(pathToFileURL(resolve(import.meta.dirname, "../billion-context-pi-pocket/bridge.ts")).href);
+    ({ deriveChildState } = await import("billion-context-pi"));
 } finally {
     loader.deregister();
 }
-const { branchEntries, importPiState, translatePiState } = mod;
+const { branchEntries, translatePiState } = mod;
+const importPiState = (companion: string, entries: Parameters<typeof mod.importPiState>[1], target: string) =>
+    mod.importPiState(companion, entries, target, deriveChildState);
 
 function fixture(count = 10) {
     const ids = Array.from({ length: count }, (_, i) => (i + 1).toString(16).padStart(8, "0"));

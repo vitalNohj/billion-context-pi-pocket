@@ -4,17 +4,13 @@
  */
 import { testHome } from "./env.ts";
 import assert from "node:assert/strict";
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 
-const repo = resolve(import.meta.dirname, "..");
-const ADAPTER = "billion-context-pi-pocket.ts";
-const BUNDLE = "billion-context-pi-pocket";
-const SETTINGS = "billion-context-pi-pocket.json";
-const LEGACY_SETTINGS = "billion-context-pi-pocket-adapter.json";
+import { repo, ENTRY as ADAPTER, FILES as BUNDLE, SETTINGS, LEGACY_SETTINGS, dropInFolder } from "./fixtures.ts";
 const pocketDir = process.env.PI_POCKET_CHECKOUT;
 const skip =
     pocketDir === undefined
@@ -33,15 +29,6 @@ let mod: any;
 let model: any;
 let requestCount = 0;
 const CHECKPOINT_KEY = "pocketBcpCheckpoint";
-
-/** A drop-in folder with the adapter, its settings, and Pi Pocket's packages, as Pi Pocket makes it. */
-function dropInFolder(folder: string, settings: Record<string, string> = {}, includeBundle = true, settingsFile = SETTINGS): string {
-    mkdirSync(folder, { recursive: true });
-    copyFileSync(join(repo, ADAPTER), join(folder, ADAPTER));
-    if (includeBundle) cpSync(join(repo, BUNDLE), join(folder, BUNDLE), { recursive: true });
-    writeFileSync(join(folder, settingsFile), JSON.stringify(settings));
-    return join(folder, ADAPTER);
-}
 
 if (skip === false) {
     h = await import(join(pocketDir!, "test", "helpers.ts"));
@@ -183,7 +170,7 @@ test("forks recover only the compression made before their fork point", { skip }
     assert.equal(state(id).blocks.length, 1);
     const system = lastRequest.filter((m: any) => m.role === "system");
     assert.ok(
-        system.some((m: any) => /compress/.test(m.sections?.billion_context ?? "")),
+        system.some((m: any) => /compress/.test(m.sections?.billion_context ?? m.content ?? "")),
         "billion-context-pi's prompt reaches the model",
     );
     const history = (await parent.context(context)).messages;
@@ -239,8 +226,8 @@ test("histories without checkpoints replay their compress calls", { skip }, asyn
         return { ...m, details };
     });
     const generation = await reloadedGeneration();
-    const output = await generation.beforeRequest({ messages }, fakeApi("no-checkpoints"), context);
-    assert.equal(state("no-checkpoints").blocks.length, 1);
+    const output = await generation.beforeRequest({ messages }, fakeApi("900001"), context);
+    assert.equal(state("900001").blocks.length, 1);
     assert.match(textOf(output.messages), /SUMMARY_A/);
     assert.doesNotMatch(textOf(output.messages), /OLD_LOG_A/);
 });
@@ -298,40 +285,40 @@ test("settings: the state folder and extension name are configurable", { skip },
     const configured = await import(pathToFileURL(file).href);
     const extension = configured.default({ dataDir: folder, notice() {} });
     assert.equal(extension.name, "bcp-adapter");
-    assert.ok(existsSync(join(folder, "bcp")));
+    assert.equal(existsSync(join(folder, "bcp")), false, "loading the installer does not create or rewrite ACP state");
 });
 
-test("a missing bundle says to copy the helper folder, without a separate pi install", { skip }, async () => {
+test("the gallery entry loads without a runtime and does not install during loading", { skip }, async () => {
     const folder = mkdtempSync(join(testHome, "missing-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
     const file = dropInFolder(folder, {}, false);
-    await assert.rejects(import(pathToFileURL(file).href), /Copy the billion-context-pi-pocket\/ folder/);
+    const configured = await import(pathToFileURL(file).href);
+    const extension = configured.default({ dataDir: folder, notice() {} });
+    assert.equal(extension.tools.length, 5, "reviewed tool declarations are stable before installation");
+    assert.equal(existsSync(join(folder, "billion-context-pi-pocket-runtime")), false);
+    assert.equal(existsSync(join(folder, "billion-context-pi")), false);
 });
 
-test("legacy package paths cannot override the pinned bundle", { skip }, async () => {
+test("legacy package paths cannot override the reviewed installer pin", { skip }, async () => {
     const folder = mkdtempSync(join(testHome, "legacy-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
     const file = dropInFolder(folder, { billionContextPi: join(folder, "not-installed") });
     const configured = await import(pathToFileURL(file).href);
-    const manifest = JSON.parse(readFileSync(join(folder, BUNDLE, "bundle.json"), "utf8"));
-    assert.equal(configured.BCP_VERSION, manifest.version);
+    const manifest = JSON.parse(readFileSync(join(folder, BUNDLE, "runtime-lock.json"), "utf8"));
+    assert.equal(configured.BCP_VERSION, manifest.current);
     assert.equal(configured.default({ dataDir: folder, notice() {} }).tools.length, 5);
 });
 
-test("a version update reloads the entry and its relative child imports", { skip }, async () => {
+test("an entry update reloads its own relative helpers without changing the runtime pin", { skip }, async () => {
     const folder = mkdtempSync(join(testHome, "reload-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
     const file = dropInFolder(folder);
     const first = await import(pathToFileURL(file).href);
-    assert.equal(first.BCP_VERSION, mod.BCP_VERSION);
-    const nextVersion = "999.0.0";
-    const runtime = join(folder, BUNDLE, `billion-context-pi-${nextVersion}`);
-    mkdirSync(join(runtime, "dist"), { recursive: true });
-    writeFileSync(join(runtime, "package.json"), JSON.stringify({ name: "billion-context-pi", version: nextVersion, type: "module" }));
-    writeFileSync(join(runtime, "dist", "child.js"), 'export const marker = "NEW_BUNDLED_CHILD_LOADED";');
-    writeFileSync(join(runtime, "dist", "index.js"), 'import { marker } from "./child.js"; throw new Error(marker);');
-    writeFileSync(join(folder, BUNDLE, "bundle.json"), JSON.stringify({ package: "billion-context-pi", version: nextVersion }));
-    await assert.rejects(import(`${pathToFileURL(file).href}?updated`), /NEW_BUNDLED_CHILD_LOADED/);
+    const helper = join(folder, BUNDLE, "bridge.ts");
+    writeFileSync(helper, `${readFileSync(helper, "utf8")}\n// test a new, reviewed helper revision\n`);
+    const updated = await import(`${pathToFileURL(file).href}?updated`);
+    assert.equal(updated.BCP_VERSION, first.BCP_VERSION);
+    assert.notEqual(updated.branchEntries, first.branchEntries, "helper code is content-versioned on reload");
 });
 
 test("decompression keeps both automatic and custom file output", { skip }, async () => {
@@ -372,7 +359,7 @@ test("the new settings file takes precedence over an invalid legacy file", { ski
     writeFileSync(join(folder, LEGACY_SETTINGS), "not valid JSON");
     const configured = await import(pathToFileURL(file).href);
     assert.equal(configured.default({ dataDir: folder, notice() {} }).name, "current-extension");
-    assert.ok(existsSync(join(folder, "current-state")));
+    assert.equal(existsSync(join(folder, "current-state")), false, "state is created on use, not while loading the installer");
 });
 
 test("an invalid new settings file cannot silently use legacy settings", { skip }, async () => {
@@ -380,7 +367,7 @@ test("an invalid new settings file cannot silently use legacy settings", { skip 
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");
     const file = dropInFolder(folder, { stateDir: "bcp", extensionName: "bcp-adapter" }, true, LEGACY_SETTINGS);
     writeFileSync(join(folder, SETTINGS), "[]");
-    await assert.rejects(import(pathToFileURL(file).href), /billion-context-pi-pocket\.json must hold a JSON object/);
+    await assert.rejects(import(pathToFileURL(file).href), /Invalid billion-context-pi-pocket settings/);
 });
 
 test("renaming a loaded module and settings keeps compressed sessions, forks, and restart recovery", { skip }, async () => {
@@ -715,9 +702,9 @@ test("decompress works through a disposable HTTP Pocket server with normal appro
     }
 });
 
-test("a terminal Pi session's compression comes along when it continues in Pocket", { skip }, async () => {
+test("a terminal Pi session's compression comes along when it continues in Pocket", { skip }, async (t) => {
     const { context, newSession, say, owner, work } = h;
-    if (typeof app.piSessions?.registerCompanion !== "function") return;
+    if (typeof app.piSessions?.registerCompanion !== "function") return t.skip("This Pocket version does not expose optional Pi-session companions");
     // Compression made here, then written out as Pi in the terminal keeps it: Pi's entry ids, and the state beside the file.
     const id = await newSession(app);
     const source = (await app.harness.conversation(id, context))!;

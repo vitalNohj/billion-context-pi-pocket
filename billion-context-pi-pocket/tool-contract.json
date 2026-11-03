@@ -1,0 +1,199 @@
+{
+  "format": 1,
+  "package": "billion-context-pi",
+  "version": "0.1.83",
+  "tools": [
+    {
+      "name": "compress",
+      "description": "Replace older conversation ranges with detailed summaries you write. Single range: compress({ content: [{ startId, endId, summary }] }). Batch: compress({ content: [{ topic, startId, endId, summary }, ...] }) — each entry gets its own summary.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Fallback topic for entries without their own. Omit when each content entry specifies its own topic."
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "startId",
+                    "endId",
+                    "summary"
+                  ],
+                  "properties": {
+                    "startId": {
+                      "type": "string",
+                      "description": "Message ref, e.g. \"m00005\" (from the acp tag), or a block id \"b3\"."
+                    },
+                    "endId": {
+                      "type": "string",
+                      "description": "Inclusive end ref. Must be at or after startId."
+                    },
+                    "summary": {
+                      "type": "string",
+                      "description": "Complete technical summary replacing all content in range. Keep only essential details (conclusions, file paths, decisions, exact values, etc.)."
+                    },
+                    "topic": {
+                      "type": "string",
+                      "description": "Short label (3-5 words) for THIS range, e.g. 'Auth System Exploration'. Omit to use top-level topic. When compressing multiple unrelated ranges, give each its own topic for better quality."
+                    }
+                  }
+                }
+              },
+              {
+                "type": "string",
+                "description": "JSON-encoded array of ranges — accepted because non-strict-tool providers sometimes stringify array arguments; parsed automatically."
+              }
+            ],
+            "description": "One or more ranges to compress, each with start/end boundaries and a summary. When compressing multiple unrelated ranges in one call, give each its own topic."
+          },
+          "summaryMaxChars": {
+            "type": "number",
+            "description": "Override max summary length (default max: 20000 chars). Use when content is important and needs more detail — don't lose critical info just to fit the limit."
+          }
+        }
+      }
+    },
+    {
+      "name": "decompress",
+      "description": "Restore a previously compressed block's content, or a single message by its ref. The block/message stays compressed — context and cache prefix are not disrupted. BLOCK decompress (blockId b5) defaults to writing a file (blocks can be large); use the read tool to access it, or inline:true to return inline. MESSAGE decompress (blockId = a message UUID from search_context) returns that ONE message's original text — defaults to inline since a single message is usually small; oversized messages go to a file. full:true recurses through nested block tiers (block mode only). You can pass a block id (b5) OR a message ref (UUID) from search_context results.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "blockId"
+        ],
+        "properties": {
+          "blockId": {
+            "type": "string",
+            "description": "Block id to restore, e.g. \"b5\". Also accepts a message ref (UUID) from search_context results — resolves to the owning block automatically."
+          },
+          "full": {
+            "type": "boolean",
+            "description": "If true, recurse through all nested blocks to original messages. Default: false (restores one tier up — nested block summaries shown, direct messages in full)."
+          },
+          "toFile": {
+            "type": "string",
+            "description": "Write restored content to this file path (must be under /tmp, ~/.cache/opencode, or ~/.cache/pi) instead of the default auto-generated path. Block stays compressed."
+          },
+          "inline": {
+            "type": "boolean",
+            "description": "If true, return content inline as this tool's result (appends to context). Default: false — content is written to an auto-generated file to avoid context bloat. Only set true when the content is small or you accept the context cost."
+          }
+        }
+      }
+    },
+    {
+      "name": "search_context",
+      "description": "Search compressed blocks AND historical messages by keyword. Use to cheaply locate detail before decompressing. Returns ranked results with ref, size, preview, and the decompress command to retrieve full content.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Keywords to locate detail folded into compressed summaries or historical messages."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max results (default 10)."
+          }
+        }
+      }
+    },
+    {
+      "name": "acp_status",
+      "description": "Context status: overview, compressed blocks, or uncompressed ranges/messages. No args = overview + totals + compressible ranges. scope:'uncompressed' + view:'messages' for per-message listing. scope:'compressed' for block drilldown.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "compressed"
+              },
+              {
+                "type": "string",
+                "const": "uncompressed"
+              }
+            ],
+            "description": "\"compressed\" = drill into blocks; \"uncompressed\" = show visible messages/ranges. Default: overview."
+          },
+          "view": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "ranges"
+              },
+              {
+                "type": "string",
+                "const": "messages"
+              }
+            ],
+            "description": "For uncompressed scope: \"ranges\" (default) or \"messages\" (per-message listing)."
+          },
+          "tool": {
+            "type": "string",
+            "description": "Filter by tool name (e.g. \"bash\", \"read\"). Only for uncompressed+messages."
+          },
+          "sort": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "size"
+              },
+              {
+                "type": "string",
+                "const": "time"
+              },
+              {
+                "type": "string",
+                "const": "tool"
+              },
+              {
+                "type": "string",
+                "const": "age"
+              }
+            ],
+            "description": "Sort order. Default: size."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max items to show (default: 30)."
+          }
+        }
+      }
+    },
+    {
+      "name": "acp_cache",
+      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, session hit rate) with every request's miss split into new content / compression re-pay / TTL expiry, plus per-fold economics (one-time cost, breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "summary"
+              },
+              {
+                "type": "string",
+                "const": "full"
+              }
+            ],
+            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+          }
+        }
+      }
+    }
+  ]
+}
