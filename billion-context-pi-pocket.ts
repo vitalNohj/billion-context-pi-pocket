@@ -2,6 +2,12 @@
  * Billion context for Pi Pocket. The gallery entry contains this integration, not the upstream program.
  * Only an owner's Install/Update action downloads the reviewed, hash-pinned upstream package.
  * Per-chat controls and installation use public extension APIs. Pocket itself is not modified.
+ *
+ * Network use, only after an owner's click (or the desktop app acting as the owner):
+ * - Install, Update, Reinstall, Repair: GET the pinned package from registry.npmjs.org. Nothing of the owner's is sent.
+ * - Check for updates: GET api.github.com/repos/vitalNohj/billion-context-pi-pocket/commits/main and its
+ *   runtime-lock.json from raw.githubusercontent.com. Nothing of the owner's is sent. The extension never replaces its
+ *   own files; the gallery, the desktop app, or the owner applies an update.
  */
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
@@ -27,6 +33,7 @@ async function ownModule(name: string) {
 }
 const { RuntimeStore, validatePin, fingerprint } = await ownModule("runtime.mjs");
 const { ContextEpochStore } = await ownModule("context.mjs");
+const { UpdateState, installedSource } = await ownModule("updates.mjs");
 const bridgeModule = await ownModule("bridge.ts");
 export const CHECKPOINT_KEY = bridgeModule.CHECKPOINT_KEY;
 export const branchEntries = bridgeModule.branchEntries;
@@ -190,6 +197,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
     }
     const store = new RuntimeStore({ root, nodeModules: join(here, "node_modules") });
     const epochs = new ContextEpochStore(join(root, "contexts"));
+    const updates = new UpdateState({ root });
     const Prefs = web?.module && web.module !== "billion-context-pi-pocket" ? preferences(web.module) : SessionPrefs;
     const modules = new Map<string, Promise<any>>();
     const kernels = new Map<string, any>();
@@ -256,6 +264,18 @@ export default function billionContextPiPocket(host: Host, web?: any) {
         if (choice?.state === "uninstalled") return false;
         const boundary = await epochs.read(String(id));
         return savedState(stateDir, id, boundary.epoch)?.blocks?.some((block: any) => block.active) === true;
+    }
+    /** Counts only, for this chat's menu: never summaries or message text. */
+    async function chatStats(id: any) {
+        try {
+            const boundary = await epochs.read(String(id));
+            const active = (savedState(stateDir, id, boundary.epoch)?.blocks ?? []).filter((block: any) => block.active);
+            return {
+                blocks: active.length,
+                originalTokens: active.reduce((sum: number, block: any) => sum + (Number(block.compressedTokens) || 0), 0),
+                summaryTokens: active.reduce((sum: number, block: any) => sum + Math.ceil(String(block.summary ?? "").length / 4), 0),
+            };
+        } catch { return undefined; }
     }
     async function pausedPrompt(id: any) {
         const boundary = await epochs.read(String(id));
@@ -362,11 +382,43 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             if (source !== undefined) {
                 session = { id: source, ...await profile(request, source, request.context) };
             }
+            const extension = installedSource({ entryDir: here, helperDir: files, name: web.module ?? "billion-context-pi-pocket", version: BCP_VERSION });
+            const stats = source === undefined ? undefined : await chatStats(source);
             return { runtime: { ...visible, managed: runtimeInfo.state === "installed", availableVersion: BCP_VERSION,
                 updateAvailable: runtimeInfo.installed && runtimeInfo.version !== BCP_VERSION,
                 downloadBytes: currentPin!.archiveBytes, diskBytes: currentPin!.unpackedBytes, host: "registry.npmjs.org" },
-                ...(session ? { session } : {}), defaultOffBehavior: defaultBehavior() };
+                extension, updates: updates.view(extension),
+                ...(session ? { session } : {}), ...(stats ? { stats } : {}), defaultOffBehavior: defaultBehavior() };
         }
+        const noBody = (request: any, what: string) => {
+            if (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length) throw web.error(400, `${what} accepts no parameters`);
+        };
+        const installedFrom = () => installedSource({ entryDir: here, helperDir: files, name: web.module ?? "billion-context-pi-pocket", version: BCP_VERSION }).source;
+        web.route("POST", "updates/check", async (request: any) => {
+            noBody(request, "Check for updates");
+            try { await updates.check(request.signal); }
+            catch (error: any) { changed(); throw web.error(502, error?.message ?? String(error)); }
+            changed();
+            return status(request);
+        });
+        // The extension never replaces its own files. The desktop app that installed them polls for this request.
+        web.route("POST", "updates/request", async (request: any) => {
+            noBody(request, "Update");
+            const from = installedFrom();
+            if (from !== "desktop") throw web.error(409, from === "gallery"
+                ? "Update it in Menu → Extensions → Updates." : "These files were copied by hand. Replace them to update.");
+            await updates.request();
+            changed();
+            return status(request);
+        });
+        web.route("POST", "updates/handled", async (request: any) => {
+            const body = request.body;
+            if (!body || typeof body !== "object" || typeof body.requested !== "number" || Object.keys(body).some((key) => key !== "requested" && key !== "error")
+                || (body.error !== undefined && typeof body.error !== "string")) throw web.error(400, "Expected requested and an optional error");
+            await updates.handled(body.requested, body.error?.slice(0, 2000));
+            changed();
+            return status(request);
+        });
         web.route("GET", "status", (request: any) => status(request));
         web.conversationRoute("GET", "status/:source", (request: any) => status(request, request.conversation.id), { conversation: "source" });
         web.route("GET", "licenses", () => ({ text: readFileSync(join(files, "THIRD-PARTY-NOTICES.txt"), "utf8") }));

@@ -2,7 +2,9 @@
 
 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) in Pi Pocket, with a menu for installing the program and choosing whether each chat uses it.
 
-The Pocket extension is small. It **does not include the whole BCP program** and does not download anything when it loads. The owner presses **Install**, **Update**, or **Repair installation** to obtain an exact, tested version. No separate Pi install, terminal commands, or npm installation scripts are needed.
+The Pocket extension is small. It **does not include the whole BCP program** and does not download anything when it loads. The owner presses **Install**, **Update**, **Reinstall**, or **Repair** to obtain an exact, tested version. No separate Pi install, terminal commands, or npm installation scripts are needed.
+
+The [Pi Pocket desktop app](https://github.com/vitalNohj/pi-pocket-gui) installs this extension automatically in the Pi Pocket it runs on that computer, and keeps it updated. Its Settings card and this menu offer the same buttons and show the same state.
 
 ## Install
 
@@ -35,10 +37,12 @@ The extension uses Pocket's public extension API and packages. It does not requi
 
 The menu is available without the BCP program installed, so you can install or repair it there.
 
-- **Install / Update / Reinstall:** verify the pinned download, check that it can load with this Pocket installation, and activate it only after those checks pass.
-- **Uninstall:** stop using the downloaded program and remove its normal cache. Chats, ACP history, chat choices, and settings remain. If program files are damaged, recovery keeps those objects in a private backup rather than following unsafe links or deleting unknown contents.
-- **Repair installation:** offered after an installation problem. It prepares a verified copy before replacing program files. A verified cached archive can be used offline. Replaced files are retained in a private recovery folder.
-- **Licenses and notices:** the upstream and dependency attribution, including the additional acp-kernel attribution terms.
+- **Install / Update:** verify the pinned download, check that it can load with this Pocket installation, and activate it only after those checks pass.
+- **Reinstall / Repair:** prepare a fresh verified copy before replacing program files. A verified cached archive can be used offline. Replaced files are retained in a private recovery folder. Repair shows when the installed program has a problem.
+- **Uninstall:** asks first. It stops using the downloaded program and removes its normal cache. Chats, ACP history, chat choices, and settings remain. If program files are damaged, recovery keeps those objects in a private backup rather than following unsafe links or deleting unknown contents.
+- **Check for updates:** asks GitHub for the newest commit of this repository (`api.github.com` and `raw.githubusercontent.com`; no user data is sent). It only runs when someone presses it, or when the desktop app checks. A desktop-managed installation shows **Update**, and the desktop app applies it. A gallery installation updates in **Menu → Extensions → Updates**. A hand-copied installation is replaced by hand.
+- **This chat:** the on/off switch, the off behavior, and counts of the chat's saved summaries (never their text).
+- **About and licenses:** the upstream and dependency attribution, including the additional acp-kernel attribution terms.
 
 A failed download or pre-activation check does not replace a working program. Install and repair do not run npm lifecycle scripts. The program downloads from `registry.npmjs.org`; its exact version, URL, archive size, and SHA512 are recorded in [`runtime-lock.json`](billion-context-pi-pocket/runtime-lock.json). The menu shows the version and estimated space before installation.
 
@@ -46,7 +50,7 @@ Successful versions stay cached until Uninstall. Repairs can retain additional r
 
 ## Turn it on or off for one chat
 
-Open **Menu → Billion context** from that chat. **Billion context in this chat** affects that chat only, starting with the next model request. It does not interrupt a response already streaming.
+Open **Menu → Billion context** from that chat. The **This chat** switch affects that chat only, starting with the next model request. It does not interrupt a response already streaming.
 
 When switched off, choose:
 
@@ -55,7 +59,7 @@ When switched off, choose:
 | **Restore original history** | Stop using BCP's transformed view. Pocket receives the normal original history and follows its own compaction settings. This does not force an immediate summary or turn on compaction if you disabled it. |
 | **Keep summaries** | Keep existing BCP summaries visible, but stop new compression. The agent can still retrieve existing context. |
 
-The extension default is **Restore original history**. Change the default in the extension's Pocket settings. Each chat can override it, or select **Use extension default** again. Turning a chat on/off alone does not create a hidden override.
+The extension default is **Restore original history**. Change the default in the extension's Pocket settings. Each chat can override it, or select **Default** again. Turning a chat on/off alone does not create a hidden override.
 
 If Pocket compacts the chat while BCP is off, turning BCP back on starts tracking the **current Pocket summary and retained history**. Pocket’s **New context** action also starts fresh tracking, even if you use the same opening message again. Neither operation revives the previous context’s compressed view. Old ACP files remain in the same state directory; the new tracking epoch uses a separate filename there. Old block IDs belong to their original tracking epoch.
 
@@ -117,6 +121,7 @@ The managed program and its archives live under:
   packages/
   contexts/
   selection.json
+  updates.json       # the last update check, and a pending desktop update request
   .recovery-*/       # private repair backups, when needed
 ```
 

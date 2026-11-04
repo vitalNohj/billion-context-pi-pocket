@@ -130,6 +130,12 @@ test("owner menu installs only after a click, rejects unpinned input, and uninst
             assert.equal(initial.runtime.state, "absent");
             assert.equal(initial.runtime.installed, false);
             assert.equal(fixture.downloads(), 0, "module load and menu status never install");
+            assert.deepEqual(initial.extension, { version: pin.version, source: "manual" });
+            assert.deepEqual(initial.updates, { available: false }, "no update request is sent before a click");
+            assert.ok(!fixture.urls.some((url: string) => url.includes("github")), "status never contacts GitHub");
+            await api("updates/request", {}, 409);
+            await api("updates/check", { force: true }, 400);
+            await api("updates/handled", { requested: "x" }, 400);
             assert.equal(existsSync(join(fixture.directory, "billion-context-pi")), false);
             await api("runtime/install", { version: "unreviewed" }, 400);
             await api("runtime/install", null, 400);
@@ -146,6 +152,10 @@ test("owner menu installs only after a click, rejects unpinned input, and uninst
             await say(fixture.app, id, "fold A");
             const snapshot = saved(fixture.directory, id);
             assert.equal(snapshot.value.blocks.length, 1);
+            const chat = await api(`status/${id}`);
+            assert.equal(chat.stats.blocks, 1);
+            assert.ok(chat.stats.originalTokens > 0 && chat.stats.summaryTokens > 0);
+            assert.doesNotMatch(JSON.stringify(chat), /SUMMARY_A|OLD_LOG_A/, "status carries counts, never summaries or messages");
             const bytes = readFileSync(snapshot.file);
             const removed = await api("runtime/uninstall", {});
             assert.equal(removed.runtime.state, "uninstalled");

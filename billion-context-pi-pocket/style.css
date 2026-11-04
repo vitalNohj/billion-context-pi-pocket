@@ -1,0 +1,63 @@
+/* Billion context menu. Only the app's public theme tokens, so themes restyle it with the app. */
+.bcp { display: grid; gap: 12px; padding: 14px; min-width: 0; overflow-wrap: anywhere; }
+.bcp > *, .bcp-card > * { min-width: 0; }
+.bcp .error-box { overflow-wrap: anywhere; }
+.bcp h3 { margin: 0; font-size: 15px; font-weight: 600; color: var(--text); }
+.bcp p { margin: 0; }
+.bcp-card {
+    display: grid; gap: 12px; padding: 14px;
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--r-card, 8px);
+}
+.bcp-head { display: flex; align-items: center; gap: 10px; }
+.bcp-grow { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.bcp-dot {
+    flex: none; width: 10px; height: 10px; border-radius: 50%;
+    background: var(--muted); box-shadow: 0 0 0 3px color-mix(in srgb, var(--muted) 20%, transparent);
+}
+.bcp-dot[data-state="on"] { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+.bcp-dot[data-state="error"] { background: var(--err); box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 22%, transparent); }
+.bcp-note { line-height: 1.45; }
+.bcp-err { color: var(--err); overflow-wrap: anywhere; }
+.bcp-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.bcp-actions .button { min-height: 36px; }
+.bcp-danger { color: var(--err); }
+.bcp-busy { display: flex; }
+.bcp-confirm {
+    display: grid; gap: 10px; padding: 12px; border-radius: var(--r-row, 6px);
+    border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+    background: color-mix(in srgb, var(--err) 8%, transparent);
+}
+.bcp-update { padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted); }
+.bcp-update[data-tone="accent"] { color: var(--accent); }
+.bcp-update[data-tone="error"] { color: var(--err); }
+.bcp-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 0; }
+.bcp-stats div {
+    display: grid; gap: 2px; padding: 8px; border-radius: var(--r-row, 6px);
+    background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.bcp-stats dt { font-size: 11px; color: var(--muted); }
+.bcp-stats dd { margin: 0; font-size: 14px; color: var(--text); }
+.bcp-field { display: grid; gap: 8px; }
+.bcp-segments {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; padding: 2px;
+    border: 1px solid var(--line); border-radius: var(--r-control, 7px);
+    background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+.bcp-segment {
+    position: relative; display: flex; align-items: center; justify-content: center; text-align: center;
+    min-height: 34px; padding: 6px 4px; border-radius: var(--r-seg, 5px);
+    color: var(--muted); font-size: 13px; cursor: pointer;
+}
+.bcp-segment input { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: inherit; }
+.bcp-segment.on { background: var(--card); color: var(--text); box-shadow: 0 1px 2px color-mix(in srgb, #000 25%, transparent); }
+.bcp-segment:has(input:disabled) { cursor: default; opacity: .6; }
+.bcp-segment:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.bcp-pad { padding: 0 4px; }
+.bcp-more { padding: 0 4px; }
+.bcp-more summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
+.bcp-more-body { display: grid; gap: 8px; padding-top: 8px; }
+.bcp-more a { color: var(--accent); }
+.bcp-more pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow: auto; margin: 0; font-size: 11px; }
+@media (max-width: 420px) {
+    .bcp-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
