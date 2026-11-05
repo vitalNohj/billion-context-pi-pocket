@@ -22,6 +22,12 @@ import {
 } from "@earendil-works/pi-durable";
 
 export const pocketApi = 1;
+/**
+ * Also load in Pocket sessions on another computer (a linked runner). Our own Node use stays on the server, where the
+ * conversation is: the managed runtime, its state, and scratch files. A requested `decompress` export writes through
+ * Pocket's `write` tool, so it lands on the session's computer.
+ */
+export const remoteSessions = true;
 const here = dirname(fileURLToPath(import.meta.url));
 const files = join(here, "billion-context-pi-pocket");
 const hash = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
