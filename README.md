@@ -95,6 +95,10 @@ An explicit `decompress({ blockId, toFile })` is **one model call**. Our extensi
 
 BCP's own automatic decompression output can use `~/.cache/pi/acp-decompress/`. Explicit destinations retain upstream's restrictions to temporary/cache locations; they are additionally checked by Pocket's normal file tool. No decompression export uploads chat text anywhere.
 
+## Sessions on another computer
+
+The entry exports `remoteSessions = true`, so a Pi Pocket that has sessions on other computers (linked runners) loads it there too. Compression, search, and status work on the conversation, which stays on the server. An explicit `decompress({ toFile })` writes through Pocket's `write` tool, so the file lands on the session's computer. Older Pi Pocket versions ignore the export.
+
 ## Files and settings
 
 An optional `billion-context-pi-pocket.json` beside the entry accepts:

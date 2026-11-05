@@ -126,6 +126,10 @@ const fakeApi = (conversationId: string) => ({
     snapshot: async () => ({ cwd: h.work, model: { provider: "faux", modelId: "faux-1" } }),
 });
 
+test("says it works in sessions on another computer", { skip }, () => {
+    assert.equal(mod.remoteSessions, true);
+});
+
 test("installs billion-context-pi's tools and prompt under the default name", { skip }, async () => {
     const extension = mod.default({ dataDir, notice() {} });
     assert.equal(extension.name, "billion-context-pi");
