@@ -763,6 +763,8 @@ test("a terminal Pi session's compression comes along when it continues in Pocke
     });
     writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
     writeFileSync(`${file}.acp.json`, JSON.stringify(piState));
+    const terminalState = readFileSync(`${file}.acp.json`);
+    const terminalHistory = readFileSync(file);
 
     assert.deepEqual((await app.piSessions.preview(owner(app), file)).companions, ["Compression state"]);
     const continued = await app.commands.continuePiSession(owner(app), file);
@@ -771,4 +773,17 @@ test("a terminal Pi session's compression comes along when it continues in Pocke
     await say(app, continued.id, "continue");
     assert.match(textOf(lastRequest), /SUMMARY_A/);
     assert.doesNotMatch(textOf(lastRequest), /OLD_LOG_A/);
+    const markerFile = join(dataDir, "billion-context-pi-pocket-runtime", "contexts", `${continued.id}.json`);
+    const adopted = JSON.parse(readFileSync(markerFile, "utf8"));
+    assert.equal(adopted.format, 2, "terminal imports adopt the new bounded proof pointer");
+    assert.equal(adopted.epoch, 0, "proof adoption does not move imported compression to a new epoch");
+    const generation = await reloadedGeneration();
+    const imported = (await app.harness.conversation(continued.id, context))!;
+    const cold = await generation.beforeRequest({ messages: (await imported.context(context)).messages }, fakeApi(continued.id), context);
+    assert.match(textOf(cold.messages), /SUMMARY_A/);
+    assert.doesNotMatch(textOf(cold.messages), /OLD_LOG_A/);
+    assert.equal(JSON.parse(readFileSync(markerFile, "utf8")).epoch, 0);
+    assert.equal(state(continued.id).blocks.length, 1);
+    assert.deepEqual(readFileSync(`${file}.acp.json`), terminalState);
+    assert.deepEqual(readFileSync(file), terminalHistory, "import and cold proof adoption never rewrite terminal history");
 });

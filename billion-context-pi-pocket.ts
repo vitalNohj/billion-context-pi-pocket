@@ -33,14 +33,16 @@ const files = join(here, "billion-context-pi-pocket");
 const hash = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
 // Version our own helpers as well as upstream imports: reloading an entry must not reuse stale helper code.
-async function ownModule(name: string) {
+async function ownModule(name: string, dependencies: string[] = []) {
     const file = join(files, name);
-    return import(`${pathToFileURL(file).href}?sha256=${hash(readFileSync(file))}`);
+    const revision = hash([name, ...dependencies].map(part => `${part}\0${hash(readFileSync(join(files, part)))}`).join("\n"));
+    return import(`${pathToFileURL(file).href}?sha256=${revision}`);
 }
 const { RuntimeStore, validatePin, fingerprint } = await ownModule("runtime.mjs");
-const { ContextEpochStore } = await ownModule("context.mjs");
+const { ContextEpochStore, sameMarker } = await ownModule("context.mjs");
+const { selectContext } = await ownModule("selection.mjs", ["context.mjs"]);
 const { UpdateState, installedSource } = await ownModule("updates.mjs");
-const bridgeModule = await ownModule("bridge.ts");
+const bridgeModule = await ownModule("bridge.ts", ["identity.mjs"]);
 export const CHECKPOINT_KEY = bridgeModule.CHECKPOINT_KEY;
 export const branchEntries = bridgeModule.branchEntries;
 export const decompressToFile = bridgeModule.decompressToFile;
@@ -176,10 +178,6 @@ function savedState(stateDir: string, id: unknown, epoch = 0) {
     const file = statePath(stateDir, id, epoch);
     try { return json(file); } catch (error: any) { if (error.code === "ENOENT") return undefined; throw error; }
 }
-function activeStateFits(state: any, messages: readonly any[]) {
-    return bridgeModule.stateFitsContext(state, messages);
-}
-
 /** Remove appended BCP action notices while paused, never the summaries within the history. */
 export function withoutNewNudges(messages: readonly any[], original: readonly any[]) {
     const identities = new Set(original.map((message) => branchEntries([message])[0]?.id).filter(Boolean));
@@ -207,6 +205,10 @@ export default function billionContextPiPocket(host: Host, web?: any) {
     const Prefs = web?.module && web.module !== "billion-context-pi-pocket" ? preferences(web.module) : SessionPrefs;
     const modules = new Map<string, Promise<any>>();
     const kernels = new Map<string, any>();
+    const requestKeys = new Map<string, string>();
+    const toolKeys = new Map<string, string>();
+    const taskKey = (api: any) => `${api.conversationId}:${api.taskId ?? "current"}`;
+    const diagnostic = (value: any) => console.info(`[billion-context-selection] ${JSON.stringify(value)}`);
     let legacy: any | false | undefined;
     const defaultBehavior = (): OffBehavior => {
         const value = web?.setting?.("offBehavior") ?? settings.offBehavior ?? "restore-history";
@@ -242,19 +244,22 @@ export default function billionContextPiPocket(host: Host, web?: any) {
         }
         return modules.get(key);
     }
-    async function kernel(id: any, api: any, context: any, messages?: readonly any[], fresh = false) {
+    async function kernel(id: any, api: any, context: any, messages?: readonly any[], fresh = false, expected?: any) {
         const sid = String(id);
         const boundary = await epochs.read(sid);
+        if (expected && !sameMarker(boundary, expected)) throw new Error("Context changed while preparing request; retry with current context");
         const choice = await selected();
         if (choice.state === "uninstalled" || choice.state === "absent") return undefined;
         const previous = kernels.get(sid);
-        if (!fresh && messages === undefined && previous?.options.epoch === boundary.epoch) return previous;
+        if (!fresh && messages === undefined && previous?.options.epoch === boundary.epoch
+            && previous?.options.generation === (boundary.generation ?? 0)) return previous;
         const value = await runtime();
         if (!value) return undefined;
-        const key = `${value.key}:${boundary.epoch}`;
+        const key = `${value.key}:${boundary.epoch}:g${boundary.generation ?? 0}`;
         let result = kernels.get(sid);
-        if (result?.key !== key) {
-            const options = { stateDir, extensionName, epoch: boundary.epoch, contextId: boundary.head };
+        const reused = result?.key === key;
+        if (!reused) {
+            const options = { stateDir, extensionName, epoch: boundary.epoch, generation: boundary.generation ?? 0, contextId: boundary.head };
             const extension = bridgeModule.createBridge(host, value.module, value.version, options);
             result = { key, options, extension, generation: extension.hooks.find((item: any) => item.handlers.beforeRequest).handlers,
                 tools: extension.hooks.find((item: any) => item.handlers.beforeTool).handlers,
@@ -263,6 +268,9 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             kernels.set(sid, result);
         }
         result.options.contextId = boundary.head;
+        const state = savedState(stateDir, sid, boundary.epoch);
+        diagnostic({ sid, epoch: boundary.epoch, generation: boundary.generation ?? 0, sidecar: basename(statePath(stateDir, sid, boundary.epoch)),
+            key, kernel: reused ? "reused" : "new", active: state?.blocks?.filter((block: any) => block.active).length ?? 0, total: state?.blocks?.length ?? 0 });
         return result;
     }
     async function protectMissingRuntime(id: any) {
@@ -302,28 +310,30 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             }
             const value = await kernel(api.conversationId, api, context);
             if (!value) return { isError: true, content: [{ type: "text", text: "Billion context is not installed. The owner can use Menu → Billion context → Install." }] };
+            const expected = toolKeys.get(taskKey(api));
+            if (expected !== undefined && expected !== value.key) {
+                diagnostic({ sid: String(api.conversationId), reason: "stale-tool-execution" });
+                return { isError: true, content: [{ type: "text", text: "Context changed before this tool ran. Retry in the current context." }] };
+            }
             return value.extension.tools.find((candidate: any) => candidate.name === tool.name).execute(params, api, context);
         },
     }));
     const generation = hook(GenerationTask, {
         async beforeRequest(request: any, api: any, context: any) {
-            const mode = await profile(api, api.conversationId, context);
-            // Observe the raw prefix even while off, so native compaction cannot resurrect old BCP checkpoints.
             const sid = String(api.conversationId);
-            const before = await epochs.read(sid);
-            const original = branchEntries(request.messages.filter((message: any) => message.role !== "system"));
-            const first = original[0]?.id;
-            const prefix = original.map((entry: any) => `${entry.id}:${entry.timestamp}`);
-            const incompatibleLegacy = before.prefixHash === undefined
-                && !activeStateFits(savedState(stateDir, sid, before.epoch), request.messages);
-            await epochs.observe(sid, first, incompatibleLegacy, prefix);
+            const expected = await epochs.read(sid);
+            const mode = await profile(api, api.conversationId, context);
+            // Observe only the request's history, even while off; reject a race instead of reading a newer native head.
+            const boundary = await selectContext({ epochs, stateDir, sid, messages: request.messages, bridge: bridgeModule,
+                version: BCP_VERSION, signal: context.abortSignal, expected, diagnostic });
             if (!mode.enabled && mode.offBehavior === "restore-history") return { messages: withPrompt(request.messages,
                 "Billion context is off for this chat. Do not use its compression tools. Pocket manages context normally.") };
-            const value = await kernel(api.conversationId, api, context, request.messages, true);
+            const value = await kernel(api.conversationId, api, context, request.messages, true, boundary);
             if (!value) {
                 if (mode.enabled && await protectMissingRuntime(api.conversationId)) throw new Error("This chat has saved BCP compression. Install billion-context-pi from its menu before continuing, or switch it off with Restore history.");
                 return { messages: withPrompt(request.messages, "Billion context is not installed. Do not use its tools. The owner can install it through Menu → Billion context.") };
             }
+            requestKeys.set(taskKey(api), value.key);
             await value.extension.prepare(request, api, context);
             const agent = await api.snapshot(AgentDoc, api.conversationId, context);
             // Render after both context-boundary detection and fork restoration, including paused summary lists.
@@ -336,9 +346,15 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             return { messages: withPrompt(mode.enabled ? messages : withoutNewNudges(messages, request.messages), text) };
         },
         async afterResponse(response: any, api: any, context: any) {
+            const expected = requestKeys.get(taskKey(api));
+            requestKeys.delete(taskKey(api));
             const mode = await profile(api, api.conversationId, context);
             if (!mode.enabled && mode.offBehavior === "restore-history") return;
             const value = await kernel(api.conversationId, api, context);
+            if (expected !== undefined && expected !== value?.key) {
+                diagnostic({ sid: String(api.conversationId), reason: "stale-response-generation" });
+                return;
+            }
             return value?.generation.afterResponse?.(response, api, context);
         },
     } as any);
@@ -347,12 +363,19 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             const mode = await profile(api, api.conversationId, context);
             if (!mode.enabled && mode.offBehavior === "restore-history") return;
             const value = await kernel(api.conversationId, api, context);
+            if (value) toolKeys.set(taskKey(api), value.key);
             return value?.tools.beforeTool?.(call, api, context);
         },
         async afterTool(call: any, result: any, api: any, context: any) {
+            const expected = toolKeys.get(taskKey(api));
+            toolKeys.delete(taskKey(api));
             const mode = await profile(api, api.conversationId, context);
             if (!mode.enabled && mode.offBehavior === "restore-history") return;
             const value = await kernel(api.conversationId, api, context);
+            if (expected !== undefined && expected !== value?.key) {
+                diagnostic({ sid: String(api.conversationId), reason: "stale-tool-generation" });
+                return result;
+            }
             return value?.tools.afterTool?.(call, result, api, context);
         },
     } as any);

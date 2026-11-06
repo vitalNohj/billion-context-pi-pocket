@@ -29,49 +29,10 @@ export const CHECKPOINT_KEY = "pocketBcpCheckpoint";
 
 // ---- fork checkpoints ----
 
-// Must match billion-context-pi's messageIdentity/stableLiveId: saved state already uses these IDs.
-const REF_SOURCE = "(?:<acp\\s[^>]*>m\\d{5}</acp>|\\[m\\d{1,5}\\])";
-const LEADING_REF = new RegExp(`^${REF_SOURCE}\\s?\\n?`);
-const TRAILING_REF = new RegExp(`\\n*${REF_SOURCE}\\s*$`);
-const stripRef = (text: string) => text.replace(LEADING_REF, "").replace(TRAILING_REF, "");
-
-function normalize(value: any, message = false): any {
-    if (Array.isArray(value)) {
-        return value.flatMap((item) => {
-            if (item?.type === "text" && typeof item.text === "string") {
-                const stripped = stripRef(item.text);
-                if (item.text !== stripped && stripped === "") return [];
-            }
-            return [normalize(item)];
-        });
-    }
-    if (value === null || typeof value !== "object") return value;
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value).sort()) {
-        if (message && key === "timestamp") continue;
-        const item = value[key];
-        if (message && key === "content" && typeof item === "string") {
-            out[key] = [{ text: stripRef(item), type: "text" }];
-        } else if (key === "text" && typeof item === "string" && value.type === "text") {
-            out[key] = stripRef(item);
-        } else {
-            out[key] = normalize(item);
-        }
-    }
-    return out;
-}
-
-/** The untransformed, fork-bounded request history as session entries, with billion-context-pi's stable IDs. */
-export function branchEntries(messages: readonly any[]): any[] {
-    const ranks = new Map<string, number>();
-    return messages.map((message) => {
-        const identity = JSON.stringify(normalize(message, true));
-        const rank = ranks.get(identity) ?? 0;
-        ranks.set(identity, rank + 1);
-        const id = `live-${createHash("sha256").update(`${identity}\0${rank}`).digest("hex").slice(0, 16)}`;
-        return { type: "message", id, parentId: null, timestamp: String(message.timestamp ?? 0), message };
-    });
-}
+const identityFile = join(import.meta.dirname, "identity.mjs");
+const identity = await import(`${pathToFileURL(identityFile).href}?sha256=${createHash("sha256").update(readFileSync(identityFile)).digest("hex")}`);
+export function branchEntries(messages: readonly any[]): any[] { return identity.branchEntries(messages); }
+export const { contextInstances, artifactIdentityCandidate, translateStateIds, legacyOrders } = identity;
 
 /** A saved pass belongs to this raw context, not merely to an identical opening message. */
 export function stateFitsContext(state: any, messages: readonly any[]): boolean {
@@ -83,6 +44,16 @@ export function stateFitsContext(state: any, messages: readonly any[]): boolean 
     // The kernel deliberately retains inactive history whose messages are no longer present.
     return state.blocks.every((block: any) => !block.active
         || (Array.isArray(block.effectiveMessageIds) && block.effectiveMessageIds.every(contains)));
+}
+
+/** Exact fit, or the one documented lossless host alias. Never the terminal import's 90% rule. */
+export function compatibleState(state: any, messages: readonly any[]) {
+    if (stateFitsContext(state, messages)) return { state, migrated: false, reason: "complete-fit" };
+    const candidate = artifactIdentityCandidate(messages);
+    if (!stateFitsContext(state, candidate.messages)) return { reason: "saved-pass-or-active-ids-missing" };
+    const translated = translateStateIds(state, candidate.aliases, candidate.origins);
+    if (!stateFitsContext(translated, messages)) return { reason: "artifact-mapping-incomplete" };
+    return { state: translated, migrated: true, aliases: candidate.aliases, reason: "artifact-inline-alias" };
 }
 
 export function readState(file: string): any | undefined {
@@ -142,6 +113,56 @@ function checkpointFor(file: string, conversationId: string, callId: string, ver
     return { version: 2, bcpVersion: version, conversationId, stateId, ...(contextId === undefined ? {} : { contextId }) };
 }
 
+/** Decode both checkpoint formats, retaining runtime/hash checks before any ID migration. */
+function checkpointState(file: string, checkpoint: any, version: string): any | undefined {
+    if (checkpoint?.bcpVersion !== version) return undefined;
+    if (checkpoint.version === 1) return checkpoint.state;
+    if (checkpoint.version !== 2) return undefined;
+    const manifest = loadObject(file, checkpoint.stateId);
+    if (!Array.isArray(manifest?.blockIds)) return undefined;
+    const blocks = manifest.blockIds.map((id: unknown) => loadObject(file, id));
+    if (blocks.some((block: any) => typeof block?.blockId !== "string")) return undefined;
+    const { blockIds: _ids, ...state } = manifest;
+    return { ...state, blocks };
+}
+
+function immutableBlock(block: any) {
+    const { active: _active, survivedCount: _age, generation: _generation, ...content } = block;
+    return content;
+}
+/** Compare immutable compression content, not the maintenance counters changed on every request. */
+export function stateIncludes(complete: any, subset: any) {
+    if (!subset?.blocks?.length) return true;
+    const blocks = new Map((complete?.blocks ?? []).map((block: any) => [block.blockId, JSON.stringify(immutableBlock(block))]));
+    return subset.blocks.every((block: any) => blocks.get(block.blockId) === JSON.stringify(immutableBlock(block)));
+}
+
+/** A fresh fork may first be read in a different physical order. Only a complete, visible
+ * checkpoint can supply its stable anchor; established native boundaries never call this. */
+export function checkpointContextId(file: string, messages: readonly any[], version: string) {
+    const ids = new Set([...branchEntries(messages), ...artifactIdentityCandidate(messages).entries].map((entry: any) => entry.id));
+    for (let index = messages.length - 1; index >= 0; index--) {
+        const checkpoint = messages[index].role === "toolResult" && messages[index].details?.[CHECKPOINT_KEY];
+        if (!checkpoint || !ids.has(checkpoint.contextId)) continue;
+        const state = checkpointState(file, checkpoint, version);
+        if (state && compatibleState(state, messages).state !== undefined) return checkpoint.contextId;
+    }
+}
+
+/** Legacy archives without a retained proof need exact, request-bounded, same-chat checkpoint provenance.
+ * A matching opening, mtime, or block count alone is never evidence. */
+export function checkpointProvesState(file: string, state: any, messages: readonly any[], version: string, sid: string, contextId: string) {
+    const ids = new Set([...branchEntries(messages), ...artifactIdentityCandidate(messages).entries].map((entry: any) => entry.id));
+    if (!ids.has(contextId)) return false;
+    return messages.some(message => {
+        const checkpoint = message.role === "toolResult" && message.details?.[CHECKPOINT_KEY];
+        if (!checkpoint || String(checkpoint.conversationId) !== sid || checkpoint.contextId !== contextId) return false;
+        const source = checkpointState(file, checkpoint, version);
+        return source && source.blocks.length === state.blocks.length && stateIncludes(source, state)
+            && compatibleState(source, messages).state !== undefined;
+    });
+}
+
 /** Restore the newest checkpoint in a fork's inherited history; never replace state the fork already has. */
 function restoreCheckpoint(file: string, messages: readonly any[], version: string, deriveChildState: (state: any) => any, contextId?: string): string | undefined {
     if ((readState(file)?.blocks.length ?? 0) > 0) return undefined;
@@ -152,20 +173,7 @@ function restoreCheckpoint(file: string, messages: readonly any[], version: stri
         const checkpoint = message.details?.[CHECKPOINT_KEY];
         if (checkpoint?.bcpVersion !== version) continue;
         if (contextId !== undefined && checkpoint.contextId !== undefined && checkpoint.contextId !== contextId) continue;
-        let source: any;
-        if (checkpoint.version === 2) {
-            const manifest = loadObject(file, checkpoint.stateId);
-            if (!Array.isArray(manifest?.blockIds)) continue;
-            const blocks = manifest.blockIds.map((id: unknown) => loadObject(file, id));
-            if (blocks.some((block: any) => typeof block?.blockId !== "string")) continue;
-            const { blockIds: _ids, ...state } = manifest;
-            source = { ...state, blocks };
-        } else if (checkpoint.version === 1) {
-            // The whole state inline, as the first version of this adapter saved it.
-            source = checkpoint.state;
-        } else {
-            continue;
-        }
+        let source = checkpointState(file, checkpoint, version);
         if (
             !Array.isArray(source?.blocks) ||
             source.blocks.length === 0 ||
@@ -175,7 +183,9 @@ function restoreCheckpoint(file: string, messages: readonly any[], version: stri
             continue;
         }
         // Head text can repeat after New context. Even a tagged checkpoint must fit the complete saved pass.
-        if (!stateFitsContext(source, messages)) continue;
+        const compatible = compatibleState(source, messages);
+        if (compatible.state === undefined) continue;
+        source = compatible.state;
         const restored = {
             ...deriveChildState(source),
             schemaVersion: source.schemaVersion,
