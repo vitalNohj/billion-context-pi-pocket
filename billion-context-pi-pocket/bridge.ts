@@ -49,7 +49,7 @@ export function stateFitsContext(state: any, messages: readonly any[]): boolean 
 /** Exact fit, or the one documented lossless host alias. Never the terminal import's 90% rule. */
 export function compatibleState(state: any, messages: readonly any[]) {
     if (stateFitsContext(state, messages)) return { state, migrated: false, reason: "complete-fit" };
-    const candidate = artifactIdentityCandidate(messages);
+    const candidate = artifactIdentityCandidate(messages, state);
     if (!stateFitsContext(state, candidate.messages)) return { reason: "saved-pass-or-active-ids-missing" };
     const translated = translateStateIds(state, candidate.aliases, candidate.origins);
     if (!stateFitsContext(translated, messages)) return { reason: "artifact-mapping-incomplete" };
@@ -100,7 +100,7 @@ function loadObject(file: string, id: unknown): any | undefined {
 }
 
 /** The checkpoint for a compress call (or a codemode script that made one): only IDs, no copies of old messages. */
-function checkpointFor(file: string, conversationId: string, callId: string, version: string, contextId?: string): any | undefined {
+function checkpointFor(file: string, conversationId: string, callId: string, version: string, contextId?: string, scope?: { epoch: number; replayFloor?: number }): any | undefined {
     const state = readState(file);
     const made = state?.blocks.some(
         (block: any) => block.compressCallId === callId || block.compressCallId?.startsWith(`${callId}/`),
@@ -110,7 +110,8 @@ function checkpointFor(file: string, conversationId: string, callId: string, ver
     const { liveRefOrigins: _origins, derivedFrom: _parent, blocks, ...snapshot } = state;
     const blockIds = blocks.map((block: any) => saveObject(file, block));
     const stateId = saveObject(file, { ...snapshot, blockIds });
-    return { version: 2, bcpVersion: version, conversationId, stateId, ...(contextId === undefined ? {} : { contextId }) };
+    return { version: 2, bcpVersion: version, conversationId, stateId, ...(contextId === undefined ? {} : { contextId }),
+        ...(scope?.replayFloor === undefined ? {} : { contextEpoch: scope.epoch }) };
 }
 
 /** Decode both checkpoint formats, retaining runtime/hash checks before any ID migration. */
@@ -140,38 +141,46 @@ export function stateIncludes(complete: any, subset: any) {
 /** A fresh fork may first be read in a different physical order. Only a complete, visible
  * checkpoint can supply its stable anchor; established native boundaries never call this. */
 export function checkpointContextId(file: string, messages: readonly any[], version: string) {
-    const ids = new Set([...branchEntries(messages), ...artifactIdentityCandidate(messages).entries].map((entry: any) => entry.id));
+    const ids = new Set(branchEntries(messages).map((entry: any) => entry.id));
     for (let index = messages.length - 1; index >= 0; index--) {
         const checkpoint = messages[index].role === "toolResult" && messages[index].details?.[CHECKPOINT_KEY];
-        if (!checkpoint || !ids.has(checkpoint.contextId)) continue;
+        if (!checkpoint) continue;
         const state = checkpointState(file, checkpoint, version);
-        if (state && compatibleState(state, messages).state !== undefined) return checkpoint.contextId;
+        const compatible = state && compatibleState(state, messages);
+        if (compatible?.state !== undefined && (ids.has(checkpoint.contextId) || compatible.aliases?.has(checkpoint.contextId))) return checkpoint.contextId;
     }
 }
 
 /** Legacy archives without a retained proof need exact, request-bounded, same-chat checkpoint provenance.
  * A matching opening, mtime, or block count alone is never evidence. */
 export function checkpointProvesState(file: string, state: any, messages: readonly any[], version: string, sid: string, contextId: string) {
-    const ids = new Set([...branchEntries(messages), ...artifactIdentityCandidate(messages).entries].map((entry: any) => entry.id));
-    if (!ids.has(contextId)) return false;
+    const ids = new Set(branchEntries(messages).map((entry: any) => entry.id));
     return messages.some(message => {
         const checkpoint = message.role === "toolResult" && message.details?.[CHECKPOINT_KEY];
         if (!checkpoint || String(checkpoint.conversationId) !== sid || checkpoint.contextId !== contextId) return false;
         const source = checkpointState(file, checkpoint, version);
-        return source && source.blocks.length === state.blocks.length && stateIncludes(source, state)
-            && compatibleState(source, messages).state !== undefined;
+        const compatible = source && compatibleState(source, messages);
+        return compatible?.state !== undefined && (ids.has(contextId) || compatible.aliases?.has(contextId))
+            && source.blocks.length === state.blocks.length && stateIncludes(source, state);
     });
 }
 
+/** A native reset (including an explicit legacy escape) must not replay its old compression receipts.
+ * New receipts carry the epoch; ordinary fresh forks without a reset floor retain legacy inheritance. */
+function checkpointInBoundary(checkpoint: any, sid: string, scope?: { epoch: number; replayFloor?: number }) {
+    return scope?.replayFloor === undefined || (String(checkpoint?.conversationId) === sid
+        && Number.isSafeInteger(checkpoint.contextEpoch) && checkpoint.contextEpoch >= scope.replayFloor && checkpoint.contextEpoch <= scope.epoch);
+}
+
 /** Restore the newest checkpoint in a fork's inherited history; never replace state the fork already has. */
-function restoreCheckpoint(file: string, messages: readonly any[], version: string, deriveChildState: (state: any) => any, contextId?: string): string | undefined {
+function restoreCheckpoint(file: string, messages: readonly any[], version: string, deriveChildState: (state: any) => any, contextId?: string, scope?: { sid: string; epoch: number; replayFloor?: number }): string | undefined {
     if ((readState(file)?.blocks.length ?? 0) > 0) return undefined;
     // Only checkpoints present at the fork cutoff can be selected.
     for (let i = messages.length - 1; i >= 0; i--) {
         const message = messages[i];
         if (message.role !== "toolResult") continue;
         const checkpoint = message.details?.[CHECKPOINT_KEY];
-        if (checkpoint?.bcpVersion !== version) continue;
+        if (checkpoint?.bcpVersion !== version || (scope && !checkpointInBoundary(checkpoint, scope.sid, scope))) continue;
         if (contextId !== undefined && checkpoint.contextId !== undefined && checkpoint.contextId !== contextId) continue;
         let source = checkpointState(file, checkpoint, version);
         if (
@@ -432,7 +441,7 @@ function json(value: unknown): any {
 }
 
 /** Pi Pocket calls this synchronously: everything asynchronous happens at import or in the hooks. */
-export function createBridge(host: Host, bcp: any, version: string, options: { stateDir: string; extensionName: string; epoch: number; contextId?: string; systemPrompt?: string }) {
+export function createBridge(host: Host, bcp: any, version: string, options: { stateDir: string; extensionName: string; epoch: number; generation?: number; replayFloor?: number; contextId?: string; systemPrompt?: string }) {
     const { stateDir, extensionName } = options;
     const factory = bcp.default;
     const deriveChildState = bcp.deriveChildState;
@@ -509,8 +518,13 @@ export function createBridge(host: Host, bcp: any, version: string, options: { s
                 getSessionId: () => conversationId,
                 getSessionFile: () => file,
                 getCwd: () => cwd ?? process.cwd(),
-                // The request's own history, already bounded by Pi Durable's fork cutoff.
-                getBranch: branch,
+                // Context rebuild must not replay pre-reset compression receipts. The live request
+                // still supplies their actual messages; original-content lookup remains complete.
+                getBranch: () => options.replayFloor === undefined ? branch() : branch().filter(entry => {
+                    const message = entry.message;
+                    return message.role !== "toolResult" || message.toolName !== "compress"
+                        || checkpointInBoundary(message.details?.[CHECKPOINT_KEY], conversationId, options);
+                }),
                 getEntries: branch,
                 getEntry: (id: string) => branch().find((entry) => entry.id === id),
                 getHeader: () => undefined,
@@ -600,7 +614,7 @@ export function createBridge(host: Host, bcp: any, version: string, options: { s
         branches.set(sid, branchEntries(request.messages));
         if (!prepared.has(sid)) {
             try {
-                const source = restoreCheckpoint(sessionFile(sid), request.messages, version, deriveChildState, options.contextId);
+                const source = restoreCheckpoint(sessionFile(sid), request.messages, version, deriveChildState, options.contextId, { ...options, sid });
                 if (source !== undefined) {
                     started.delete(sid);
                     host.notice("info", `Restored compression inherited from session ${source}.`, sid);
@@ -673,7 +687,7 @@ export function createBridge(host: Host, bcp: any, version: string, options: { s
             // Codemode drops a nested compress's details, so its outer result carries the checkpoint too.
             if (call.name === "compress" || call.name === "codemode") {
                 try {
-                    const checkpoint = checkpointFor(sessionFile(sid), sid, call.id, version, options.contextId);
+                    const checkpoint = checkpointFor(sessionFile(sid), sid, call.id, version, options.contextId, options);
                     if (checkpoint !== undefined && (call.name !== "compress" || next.isError !== true)) {
                         next = { ...next, details: { ...next.details, [CHECKPOINT_KEY]: checkpoint } };
                     }

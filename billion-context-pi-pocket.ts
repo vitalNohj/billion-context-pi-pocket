@@ -259,7 +259,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
         let result = kernels.get(sid);
         const reused = result?.key === key;
         if (!reused) {
-            const options = { stateDir, extensionName, epoch: boundary.epoch, generation: boundary.generation ?? 0, contextId: boundary.head };
+            const options = { stateDir, extensionName, epoch: boundary.epoch, generation: boundary.generation ?? 0, replayFloor: boundary.replayFloor, contextId: boundary.head };
             const extension = bridgeModule.createBridge(host, value.module, value.version, options);
             result = { key, options, extension, generation: extension.hooks.find((item: any) => item.handlers.beforeRequest).handlers,
                 tools: extension.hooks.find((item: any) => item.handlers.beforeTool).handlers,
@@ -325,7 +325,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             const mode = await profile(api, api.conversationId, context);
             // Observe only the request's history, even while off; reject a race instead of reading a newer native head.
             const boundary = await selectContext({ epochs, stateDir, sid, messages: request.messages, bridge: bridgeModule,
-                version: BCP_VERSION, signal: context.abortSignal, expected, diagnostic });
+                version: BCP_VERSION, signal: context.abortSignal, expected, restoreHistory: !mode.enabled && mode.offBehavior === "restore-history", diagnostic });
             if (!mode.enabled && mode.offBehavior === "restore-history") return { messages: withPrompt(request.messages,
                 "Billion context is off for this chat. Do not use its compression tools. Pocket manages context normally.") };
             const value = await kernel(api.conversationId, api, context, request.messages, true, boundary);

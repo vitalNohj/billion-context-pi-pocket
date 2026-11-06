@@ -8,7 +8,7 @@ const HEX = /^[a-f0-9]{64}(?![\s\S])/;
 const HEAD = /^live-[a-f0-9]{16}(?![\s\S])/;
 const MAX_PROOF = 128 * 1024 * 1024;
 export const digest = prefix => createHash('sha256').update(JSON.stringify(prefix)).digest('hex');
-export const sameMarker = (a, b) => ['epoch', 'head', 'prefixLength', 'prefixHash', 'proof', 'boundary', 'generation'].every(key => a[key] === b[key]);
+export const sameMarker = (a, b) => ['epoch', 'head', 'prefixLength', 'prefixHash', 'proof', 'boundary', 'generation', 'replayFloor'].every(key => a[key] === b[key]);
 // Reloaded helpers/wrappers share one commit line; never publish a stale observation over a native boundary.
 const lockKey = Symbol.for('billion-context-pi-pocket.context-commits');
 const commits = globalThis[lockKey] ??= new Map();
@@ -91,9 +91,11 @@ function markerValue(value) {
     const hasProof = value.prefixLength !== undefined || value.prefixHash !== undefined;
     if (hasProof && (!Number.isSafeInteger(value.prefixLength) || value.prefixLength < 0 || !HEX.test(value.prefixHash))) throw new Error('Invalid context-prefix proof');
     if (value.generation !== undefined && (!Number.isSafeInteger(value.generation) || value.generation < 0)) throw new Error('Invalid repair generation');
+    if (value.replayFloor !== undefined && (!Number.isSafeInteger(value.replayFloor) || value.replayFloor < 0 || value.replayFloor > value.epoch)) throw new Error('Invalid context replay floor');
     if (value.format === 2 && (!HEX.test(value.proof) || !HEX.test(value.boundary))) throw new Error('Invalid context-proof pointer');
     return { epoch: value.epoch, head: value.head, ...(hasProof ? { prefixLength: value.prefixLength, prefixHash: value.prefixHash } : {}),
         ...(value.generation === undefined ? {} : { generation: value.generation }),
+        ...(value.replayFloor === undefined ? {} : { replayFloor: value.replayFloor }),
         ...(value.format === 2 ? { proof: value.proof, boundary: value.boundary } : {}) };
 }
 
@@ -124,7 +126,7 @@ export class ContextEpochStore {
         if (createHash('sha256').update(text).digest('hex') !== marker.proof) throw new Error('Context proof hash mismatch; explicit repair required');
         const proof = JSON.parse(text);
         if (proof.format !== 1 || proof.conversationId !== String(id) || proof.epoch !== marker.epoch || proof.head !== marker.head
-            || proof.boundary !== marker.boundary || !Array.isArray(proof.instances) || proof.instances.some(entry => !Array.isArray(entry) || entry.length !== 3
+            || proof.boundary !== marker.boundary || proof.replayFloor !== marker.replayFloor || !Array.isArray(proof.instances) || proof.instances.some(entry => !Array.isArray(entry) || entry.length !== 3
                 || typeof entry[0] !== 'string' || entry[0].length > 512 || typeof entry[1] !== 'string' || entry[1].length > 512 || !Number.isSafeInteger(entry[2]) || entry[2] <= 0)
             || new Set(proof.instances.map(([id, time]) => JSON.stringify([id, time]))).size !== proof.instances.length) throw new Error('Invalid context proof');
         return proof;
@@ -132,7 +134,8 @@ export class ContextEpochStore {
     async publish(id, next, instances, signal) {
         await directory(this.root, true);
         if (instances !== undefined) {
-            const proof = { format: 1, conversationId: String(id), epoch: next.epoch, head: next.head, boundary: next.boundary, instances };
+            const proof = { format: 1, conversationId: String(id), epoch: next.epoch, head: next.head, boundary: next.boundary, instances,
+                ...(next.replayFloor === undefined ? {} : { replayFloor: next.replayFloor }) };
             const text = JSON.stringify(proof);
             if (Buffer.byteLength(text) > MAX_PROOF) throw new Error('Context proof too large');
             next.proof = createHash('sha256').update(text).digest('hex');
@@ -193,10 +196,16 @@ export class ContextEpochStore {
         }));
         const old = await this.proof(id, previous);
         let verified = false;
+        let legacyBoundary = false;
         if (!reset && instances !== undefined && old) verified = contains(old.instances, instances);
         else if (!reset && prefix !== undefined && previous.prefixLength !== undefined) {
             verified = [prefix, ...(options.legacyOrders ?? [])].some(order => order.length >= previous.prefixLength && digest(order.slice(0, previous.prefixLength)) === previous.prefixHash);
-            if (!verified && !options.incompatibleLegacy) throw new Error('Legacy context digest cannot be proved; explicit repair required (files retained)');
+            if (!verified) {
+                // Fewer instances cannot be a permutation. Otherwise retain ambiguous migration files,
+                // except when a complete saved pass proves missing IDs or the user explicitly restores raw history.
+                legacyBoundary = prefix.length < previous.prefixLength || options.incompatibleLegacy === true || options.allowLegacyReset === true;
+                if (!legacyBoundary) throw new Error('Legacy context digest cannot be proved; explicit repair required (files retained)');
+            }
         }
         else if (!reset && prefix !== undefined && previous.head !== undefined && previous.prefixLength === undefined) {
             // Head-only releases stored no counts/timestamps. Retain their compatibility fallback,
@@ -206,7 +215,8 @@ export class ContextEpochStore {
         const becameEmpty = instances?.length === 0 && previous.head !== undefined && (old ? count(old.instances) !== 0 : previous.prefixLength !== 0);
         const mismatch = old && instances !== undefined && !verified;
         const changedHead = previous.head !== undefined && previous.head !== head && previous.prefixLength !== 0 && !verified;
-        const changed = reset || mismatch || becameEmpty || changedHead || options.incompatibleLegacy === true;
+        const changed = reset || mismatch || becameEmpty || changedHead || legacyBoundary
+            || (options.incompatibleLegacy === true && previous.prefixLength === undefined);
         const minimum = previous.epoch + Number(changed);
         const epoch = changed && options.allocateEpoch ? await options.allocateEpoch(minimum) : minimum;
         if (!Number.isSafeInteger(epoch) || epoch < minimum) throw new Error('Context epoch exhausted');
@@ -217,7 +227,9 @@ export class ContextEpochStore {
         // A verified permutation must not churn the marker or the stable checkpoint anchor.
         if (!changed && old && instances && digest(old.instances) === digest(instances)) return previous;
         if (previous.epoch === epoch && previous.head === anchor && prefix === undefined) return previous;
-        return this.publish(id, { epoch, head: anchor, ...proof, ...(!changed && previous.generation !== undefined ? { generation: previous.generation } : {}), ...(instances ? { boundary } : {}) }, instances, options.signal);
+        const replayFloor = changed && prefix !== undefined ? epoch : previous.replayFloor;
+        return this.publish(id, { epoch, head: anchor, ...proof, ...(!changed && previous.generation !== undefined ? { generation: previous.generation } : {}),
+            ...(replayFloor === undefined ? {} : { replayFloor }), ...(instances ? { boundary } : {}) }, instances, options.signal);
     }
     /** A proven derived state selects a fresh epoch but retains its native boundary witness. */
     async repair(id, epoch, prefix, instances, signal, expected) {
@@ -227,6 +239,7 @@ export class ContextEpochStore {
         const previous = await this.read(id);
         if (expected && !sameMarker(previous, expected)) throw new Error('Context changed during repair; retry required');
         if (!Number.isSafeInteger(epoch) || epoch <= previous.epoch || !previous.boundary) throw new Error('Invalid context repair epoch');
-        return this.publish(id, { epoch, head: previous.head, boundary: previous.boundary, prefixLength: prefix.length, prefixHash: digest(prefix) }, multiset(instances), signal);
+        return this.publish(id, { epoch, head: previous.head, boundary: previous.boundary, prefixLength: prefix.length, prefixHash: digest(prefix),
+            ...(previous.replayFloor === undefined ? {} : { replayFloor: previous.replayFloor }) }, multiset(instances), signal);
     }
 }

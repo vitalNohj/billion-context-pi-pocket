@@ -53,27 +53,56 @@ export function contextInstances(messages) {
     });
 }
 
+function savedRawIds(state) {
+    const blocks = Array.isArray(state?.blocks) ? state.blocks : [];
+    const values = [
+        ...(Array.isArray(state?.lastPassIds) ? state.lastPassIds : []),
+        ...blocks.flatMap(block => [...(block.directMessageIds ?? []), ...(block.effectiveMessageIds ?? [])]),
+        ...Object.keys(state?.messageRefs?.byRaw ?? {}), ...Object.values(state?.messageRefs?.byRef ?? {}),
+        ...(state?.liveRefOrigins ?? []).map(origin => origin.rawId),
+        ...(state?.absorbed ?? []).flatMap(record => [record.callMessageId, record.resultMessageId]),
+        ...(state?.imageShrinks ?? []).map(record => record.rawMessageId),
+    ];
+    return new Set(values.filter(value => typeof value === 'string').map(value => value.split('#', 1)[0]));
+}
+
 /** Reconstruct only the lossless, paired legacy form (no pre-existing inline argument).
- * Its old content ID must actually occur in saved state / a verified old digest before it is used.
- * A modern call alone is not evidence of an alias; absent/edited/synthetic results do not fit that state.
+ * Resolve each pair against saved result identities, not an all-or-nothing history rewrite:
+ * one assistant message may contain both a renamed legacy call and an already-modern call.
+ * The complete saved-pass / active-ID fit must still prove the resulting assistant identities.
+ * With no state, the all-legacy candidate is usable only when a retained digest proves it.
  */
-export function artifactIdentityCandidate(messages) {
+export function artifactIdentityCandidate(messages, state) {
     const calls = new Set(messages.flatMap(message => message.role === 'assistant' && Array.isArray(message.content)
         ? message.content.filter(part => part.type === 'toolCall' && part.name === 'artifact' && typeof part.id === 'string' && part.id.length > 0 && part.arguments?.inline === true).map(part => part.id) : []));
     const paired = new Set(messages.filter(message => message.role === 'toolResult' && message.toolName === 'artifact' && calls.has(message.toolCallId)).map(message => message.toolCallId));
-    const originals = messages.map(message => {
-        if (message.role === 'toolResult' && message.toolName === 'artifact' && paired.has(message.toolCallId)) return { ...message, toolName: 'artifact_inline' };
+    const reconstruct = pairs => messages.map(message => {
+        if (message.role === 'toolResult' && message.toolName === 'artifact' && pairs.has(message.toolCallId)) return { ...message, toolName: 'artifact_inline' };
         if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
         return { ...message, content: message.content.map(part => {
-            if (part.type !== 'toolCall' || part.name !== 'artifact' || part.arguments?.inline !== true || !paired.has(part.id)) return part;
+            if (part.type !== 'toolCall' || part.name !== 'artifact' || part.arguments?.inline !== true || !pairs.has(part.id)) return part;
             const { inline: _inline, ...args } = part.arguments;
             return { ...part, name: 'artifact_inline', arguments: args };
         }) };
     });
+    const current = branchEntries(messages);
+    let originals = reconstruct(paired);
+    if (state !== undefined) {
+        const saved = savedRawIds(state);
+        const inverse = branchEntries(originals);
+        const provenPairs = new Set();
+        messages.forEach((message, i) => {
+            if (message.role !== 'toolResult' || !paired.has(message.toolCallId)) return;
+            const legacy = saved.has(inverse[i].id);
+            const modern = saved.has(current[i].id);
+            if (legacy && modern) throw new Error('Ambiguous artifact pair identities; explicit repair required');
+            if (legacy) provenPairs.add(message.toolCallId);
+        });
+        originals = reconstruct(provenPairs);
+    }
     // Prove every other field, including timestamps, IDs, result bodies and details, is unchanged.
     if (JSON.stringify(normalize(originals.map(artifactPresentation))) !== JSON.stringify(normalize(messages.map(artifactPresentation)))) throw new Error('Unproven artifact presentation migration');
     const old = branchEntries(originals);
-    const current = branchEntries(messages);
     const aliases = new Map(old.flatMap((entry, i) => entry.id === current[i].id ? [] : [[entry.id, current[i].id]]));
     if (new Set(aliases.values()).size !== aliases.size) throw new Error('Ambiguous artifact identity migration');
     const origins = new Map(old.flatMap((entry, i) => entry.id === current[i].id ? [] : [[entry.id, {
@@ -121,7 +150,7 @@ export function translateStateIds(state, aliases, origins = new Map()) {
 /** Candidate old orders must still verify the original digest; saved-pass order is not trusted alone. */
 export function legacyOrders(messages, state) {
     const current = branchEntries(messages.filter(message => message.role !== 'system'));
-    const old = artifactIdentityCandidate(messages.filter(message => message.role !== 'system')).entries;
+    const old = artifactIdentityCandidate(messages.filter(message => message.role !== 'system'), state).entries;
     const candidates = [current, old];
     if (Array.isArray(state?.lastPassIds)) {
         const ids = [...new Set(state.lastPassIds.map(id => id.split('#', 1)[0]))];

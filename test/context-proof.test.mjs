@@ -33,6 +33,31 @@ for (const reordered of [[`${A}:10`, `${C}:30`, `${B}:20`], [`${B}:20`, `${A}:10
     });
 }
 
+test('ordered legacy empty/shrunk contexts reset once, while an ambiguous equal-size read needs an explicit escape', async t => {
+    const { root, store } = await fixture(t);
+    const legacy = { format: 1, epoch: 0, head: A, prefixLength: 2, prefixHash: digest([`${A}:1`, `${B}:2`]) };
+    await writeFile(store.file(12), JSON.stringify(legacy));
+    const empty = await store.observe(12, undefined, false, []);
+    assert.equal(empty.epoch, 1);
+    assert.equal(empty.replayFloor, 1);
+    assert.equal((await new ContextEpochStore(root).observe(12, undefined, false, [])).epoch, 1);
+    const grown = await store.observe(12, A, false, [`${A}:100`]);
+    assert.equal(grown.replayFloor, 1, 'the replay barrier survives growth from empty');
+    const repaired = await store.repair(12, 3, [`${A}:100`], [[A, '100']]);
+    assert.equal(repaired.replayFloor, 1, 'same-boundary identity repair retains the barrier');
+    await writeFile(store.file(13), JSON.stringify(legacy));
+    assert.equal((await store.observe(13, C, false, [`${C}:100`])).epoch, 1, 'a genuine shrink cannot be a permutation');
+    await writeFile(store.file(14), JSON.stringify(legacy));
+    await assert.rejects(store.observe(14, A, false, [`${A}:100`, `${B}:200`]), /explicit repair required/);
+    const escaped = await store.observe(14, A, false, [`${A}:100`, `${B}:200`], { allowLegacyReset: true });
+    assert.equal(escaped.epoch, 1);
+    assert.equal(escaped.replayFloor, 1);
+    const pointer = JSON.parse(await readFile(store.file(14), 'utf8'));
+    delete pointer.replayFloor;
+    await writeFile(store.file(14), JSON.stringify(pointer));
+    await assert.rejects(store.read(14), /Invalid context proof/, 'the replay floor is bound into the immutable object');
+});
+
 test('canonical content/time/count proof decouples identical-content occurrence rank from timestamp', async t => {
     const { root, store } = await fixture(t);
     const first = { role: 'user', content: 'same', timestamp: 10 };

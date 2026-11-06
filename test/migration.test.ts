@@ -101,6 +101,123 @@ async function folded(f: any) {
     return messages;
 }
 
+for (const [sharedAssistant, proof] of [[false, 'canonical'], [false, 'ordered'], [false, 'head-only'], [true, 'canonical'], [true, 'ordered'], [true, 'head-only']] as const) {
+    test(`mixed legacy/modern artifact pairs migrate selectively, including ${sharedAssistant ? 'multiple calls in the opening assistant' : 'separate assistant messages'} (${proof})`, { skip }, async t => {
+        const f = await fixture(t);
+        const messages = rawHistory();
+        const modernCall = { type: 'toolCall', id: 'already-modern', name: 'artifact', arguments: { inline: true, id: 'modern-report', content: 'ALREADY_MODERN_FACT: unchanged arguments.\n'.repeat(800) } };
+        const modernResult = { role: 'toolResult', toolName: 'artifact', toolCallId: modernCall.id, content: [{ type: 'text', text: 'ALREADY_MODERN_RESULT: unchanged result.\n'.repeat(800) }], details: { artifactId: 'modern-report' }, timestamp: 35 };
+        if (sharedAssistant) {
+            messages[1].content.push(modernCall);
+            messages.splice(3, 0, modernResult);
+            messages.shift(); // The anchor itself needs the selective, multi-call alias proof.
+        } else messages.splice(3, 0, { role: 'assistant', content: [modernCall], timestamp: 32 }, modernResult);
+        await f.before(messages);
+        const raw = branchEntries(messages);
+        const legacyIndex = messages.findIndex(message => message.role === 'toolResult' && message.toolName === 'artifact_inline');
+        const modernIndex = messages.indexOf(modernResult);
+        const refs = f.state().messageRefs.byRaw;
+        const modernRef = refs[raw[modernIndex].id];
+        await f.compress(messages, refs[raw[legacyIndex].id], modernRef,
+            'MIXED_KNOWN_FACT: the legacy runner is violet and the already-modern artifact keeps every original argument and result.');
+        await f.before(messages);
+        const full = f.state(), original = readFileSync(f.file(0));
+        const anchor = f.marker().head;
+        const modern = await f.migrated(messages);
+        const fit = f.bridge.compatibleState(full, modern);
+        assert.equal(fit.migrated, true);
+        assert.equal(fit.aliases.has(raw[modernIndex].id), false, 'already-modern result identity stays untouched');
+        assert.equal(fit.aliases.has(raw[legacyIndex].id), true);
+        assert.deepEqual(contextInstances(messages), contextInstances(modern));
+        const openingComposites = Object.entries(full.messageRefs.byRaw).filter(([id]) => id.startsWith(`${raw[0].id}#`));
+        if (sharedAssistant) {
+            assert.ok(openingComposites.length >= 2, 'real runtime refs contain both logical calls');
+            for (const [id, ref] of openingComposites) assert.equal(fit.state.messageRefs.byRef[ref as string], `${branchEntries(modern)[0].id}${id.slice(raw[0].id.length)}`);
+        }
+        // Legacy migration must also select the mixed original, not reverse the whole pass.
+        if (proof !== 'canonical') writeFileSync(join(f.markers, `${f.sid}.json`), JSON.stringify({ format: 1, epoch: 0, head: anchor,
+            ...(proof === 'ordered' ? { prefixLength: messages.length, prefixHash: digest(prefix(messages)) } : {}) }));
+        const output = await f.before(modern);
+        assert.equal(f.marker().epoch, 1);
+        assert.equal(f.marker().head, anchor);
+        assert.equal(f.state().blocks.length, full.blocks.length);
+        assert.equal(f.state().messageRefs.byRef[modernRef], raw[modernIndex].id);
+        assert.deepEqual(readFileSync(f.file(0)), original);
+        assert.match(text(output.messages), /MIXED_KNOWN_FACT/);
+        const growth = [...modern, { role: 'assistant', content: [{ ...modernCall, id: 'new-modern' }], timestamp: 900 },
+            { ...modernResult, toolCallId: 'new-modern', timestamp: 901 }];
+        const growingFit = f.bridge.compatibleState(full, growth);
+        assert.equal(growingFit.migrated, true);
+        assert.equal(growingFit.state.lastPassIds.length, full.lastPassIds.length);
+        await f.before(growth);
+        f.reload(); await f.before(growth);
+        assert.equal(f.marker().epoch, 1);
+        f.api.conversationId = '778';
+        const forked = await f.before(modern);
+        assert.match(text(forked.messages), /MIXED_KNOWN_FACT/);
+        assert.equal(JSON.parse(readFileSync(join(f.stateDir, '778.jsonl.acp.json'), 'utf8')).blocks.length, full.blocks.length);
+    });
+}
+
+for (const mode of ['enabled', 'restore-history', 'keep-summaries']) {
+    test(`ordered legacy native reset and compaction keep the continuation path open (${mode})`, { skip }, async t => {
+        for (const emptyFirst of [true, false]) {
+            const f = await fixture(t);
+            const messages = await folded(f);
+            const original = readFileSync(f.file(0));
+            writeFileSync(join(f.markers, `${f.sid}.json`), JSON.stringify({ format: 1, epoch: 0, head: f.marker().head, prefixLength: messages.length, prefixHash: digest(prefix(messages)) }));
+            f.mode(mode === 'enabled', mode === 'keep-summaries' ? mode : 'restore-history');
+            if (emptyFirst) { await f.before([]); await f.before([]); }
+            const compacted = [user('POCKET_NATIVE_COMPACTION: a new logical boundary.', 8000)];
+            const output = await f.before(compacted);
+            assert.equal(f.marker().epoch, 1);
+            assert.equal(f.marker().replayFloor, 1);
+            assert.ok(!existsSync(f.file()) || f.state().blocks.length === 0);
+            assert.deepEqual(readFileSync(f.file(0)), original);
+            assert.doesNotMatch(text(output.messages), /COMPRESSED_KNOWN_FACT|KNOWN_RESULT_FACT/);
+            f.reload(); await f.before(compacted);
+            assert.equal(f.marker().epoch, 1);
+        }
+    });
+}
+
+test('Off/Restore history escapes an ambiguous legacy digest without restoring old checkpoints or replaying their compress calls', { skip }, async t => {
+    const f = await fixture(t);
+    const messages = await folded(f);
+    const original = readFileSync(f.file(0));
+    const old = { format: 1, epoch: 0, head: f.marker().head, prefixLength: messages.length, prefixHash: digest(prefix(messages)) };
+    writeFileSync(join(f.markers, `${f.sid}.json`), JSON.stringify(old));
+    const retimed = messages.map(message => ({ ...message, timestamp: message.timestamp + 1000 }));
+    assert.equal(f.bridge.stateFitsContext(f.state(), retimed), true, 'content IDs alone cannot prove changed timestamps');
+    await assert.rejects(f.before(retimed), /Legacy context digest cannot be proved/);
+    assert.equal(f.marker().epoch, 0, 'ambiguous enabled migration remains fail-closed');
+    f.mode(false);
+    const off = await f.before(retimed);
+    assert.match(text(off.messages), /KNOWN_RESULT_FACT/);
+    assert.equal(f.marker().epoch, 1);
+    assert.equal(f.marker().replayFloor, 1);
+    assert.deepEqual(readFileSync(f.file(0)), original);
+    f.mode(true);
+    await f.before(retimed);
+    assert.equal(f.state().blocks.length, 0, 'old inline/v2 checkpoints and successful replay receipts are fenced out');
+    f.reload(); await f.before(retimed);
+    assert.equal(f.state().blocks.length, 0, 'the barrier persists across a cold read');
+    const resultId = branchEntries(retimed)[2].id;
+    const resultRef = f.state().messageRefs.byRaw[resultId];
+    const saved = await f.compress(retimed, resultRef, resultRef,
+        'POST_RESET_KNOWN_FACT: this is a new compression of the still-visible original runner result, made after the explicit reset.');
+    assert.equal(saved.details.pocketBcpCheckpoint.contextEpoch, 1);
+    await f.before(retimed);
+    const decompressed = await f.execute('decompress', { blockId: 'b1', inline: true });
+    assert.notEqual(decompressed.isError, true, text([decompressed]));
+    assert.match(text([decompressed]), /KNOWN_RESULT_FACT/, 'original lookup is not filtered with obsolete replay receipts');
+    rmSync(f.file()); f.reload();
+    await f.before(retimed);
+    assert.equal(f.state().blocks.length, 1, 'a new checkpoint inside this boundary still restores after state loss');
+    assert.match(f.state().blocks[0].summary, /POST_RESET_KNOWN_FACT/);
+    assert.equal(f.marker().epoch, 1);
+});
+
 // Unit-strength adversarial checks use the actual bridge compatibility primitive, not a permissive mock.
 test('typed aliases preserve composite refs, origins, inactive/nested blocks and all non-ID state', { skip }, async t => {
     const f = await fixture(t);
