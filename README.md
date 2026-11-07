@@ -73,6 +73,12 @@ Existing `extensionName` and `stateDir` settings are preserved. Updating the pro
 
 Forks inherit only compression available at their fork point. Checkpoints live with the transcript; larger checkpoint data uses a content-addressed store in the existing ACP state directory. New forks and restarts can recover compressed context without copying mutable live session state. Context-boundary and saved-pass checks prevent an old checkpoint from crossing a native-compaction or New context boundary, while preserving compatible legacy state.
 
+Re-reading the same message instances in a different order now keeps their compression, even when the first physical message changes. The proof tracks content identity, timestamps and duplicate counts, not encounter order; the actual order still goes to the model. Pocket's exact, paired `artifact_inline` → `artifact` with `inline: true` presentation migration is also recognized, including histories and individual assistant messages that mix legacy and already-modern calls. Other tool renames, argument/detail edits, deletions, changed timestamps and lost duplicate occurrences are not treated as equivalent.
+
+Compatible older markers are verified and migrated without resetting every chat. An identity repair writes a complete derived state into a fresh epoch before switching the marker and runtime cache key; original ACP files and immutable checkpoints remain intact. Set-aside state needs complete saved-pass/active-ID coverage and same-chat, same-boundary proof—not merely a similar opening, newer file or more blocks. If that cannot be proved, the extension retains the files and reports that explicit repair is required instead of silently selecting a shorter state. An empty or genuinely shorter legacy context still starts fresh tracking. For an ambiguous older ordered witness, **Off + Restore history** is an explicit escape: it continues with raw history in a fresh boundary, without restoring or replaying the old compression. New compression and its checkpoints work normally if you turn BCP back on.
+
+**Limit:** additional message instances count as growth even if they appear among old messages. A message-only multiset cannot distinguish a genuine historical insertion from a newly appended tool result moved there by Pocket. This does not weaken deletion, replacement, timestamp, duplicate-count or native-boundary checks.
+
 ## Continuing a terminal Pi session
 
 Install the program from **Menu → Billion context** before continuing a compressed terminal Pi session. On a Pocket version with `registerPiSessionCompanion`, the extension imports the session's `.jsonl.acp.json` sidecar when at least 90% of its compressed message IDs match the copied context. It keeps the compression refs and summaries, translates ordinary and composite message IDs, and never replaces compression already saved for the destination chat.
@@ -124,12 +130,15 @@ The managed program and its archives live under:
   archives/
   packages/
   contexts/
+    <conversation>.json   # bounded current-epoch pointer
+    proofs/               # immutable content/time/count identity proofs, no message text
+    epochs/               # retained per-epoch proof pointers
   selection.json
   updates.json       # the last update check, and a pending desktop update request
   .recovery-*/       # private repair backups, when needed
 ```
 
-This is separate from `stateDir`, which contains ACP's saved compression and checkpoint objects. The `contexts/` records track the current history epoch; they are not a replacement location for ACP history. Program Uninstall leaves those records and your state directory intact.
+This is separate from `stateDir`, which contains ACP's saved compression and checkpoint objects. The `contexts/` records track the current history epoch; they are not a replacement location for ACP history. Program Uninstall leaves those records and your state directory intact. New format-2 markers deliberately fail closed in older releases: for a downgrade, keep matching backups of the markers, proofs and ACP state rather than deleting markers or forcing an old epoch.
 
 The upstream self-updater is disabled with `ACP_AUTO_UPDATE=0`. Pocket forks use `PI_ACP_FORK_HOST=1`. The integration ignores upstream terminal UI commands/renderers and does not expose its late-registered delegate tools.
 
