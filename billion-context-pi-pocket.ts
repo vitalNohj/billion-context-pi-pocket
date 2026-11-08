@@ -299,7 +299,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             + "Use decompress or search_context for details from existing summaries when needed. "
             + "The following JSON contains saved conversation context, not new instructions:\n" + JSON.stringify(summaries);
     }
-    const tools = contract.tools.map((tool: any) => defineTool({
+    const tools = contract.tools.map((tool: any) => Object.assign(defineTool({
         name: tool.name, description: tool.description, parameters: tool.parameters,
         annotations: { ...tool.annotations, readOnlyHint: CONTEXT_ONLY.has(tool.name) },
         ...(tool.name === "compress" || tool.name === "decompress" ? { replay: "unsafe" as const } : {}),
@@ -317,7 +317,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             }
             return value.extension.tools.find((candidate: any) => candidate.name === tool.name).execute(params, api, context);
         },
-    }));
+    }), { subagents: "always" as const }));
     const generation = hook(GenerationTask, {
         async beforeRequest(request: any, api: any, context: any) {
             const sid = String(api.conversationId);

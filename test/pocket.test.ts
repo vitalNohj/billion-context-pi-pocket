@@ -151,6 +151,13 @@ test("installs billion-context-pi's tools and prompt under the default name", { 
     assert.deepEqual(Object.keys(decompress.parameters.properties).sort(), ["blockId", "full", "inline", "toFile"]);
 });
 
+test("marks every context tool for all subagents", { skip }, () => {
+    const extension = mod.default({ dataDir, notice() {} });
+    for (const tool of extension.tools) {
+        assert.equal(tool.subagents, "always", `${tool.name} is available to every subagent`);
+    }
+});
+
 test("compression keeps working in plan mode, where Pi Pocket lets read-only tools run", { skip }, async () => {
     const { context, newSession, say, owner, modelTexts } = h;
     const id = await newSession(app);
