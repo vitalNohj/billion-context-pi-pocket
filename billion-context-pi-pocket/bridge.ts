@@ -34,25 +34,36 @@ const identity = await import(`${pathToFileURL(identityFile).href}?sha256=${crea
 export function branchEntries(messages: readonly any[]): any[] { return identity.branchEntries(messages); }
 export const { contextInstances, artifactIdentityCandidate, translateStateIds, legacyOrders } = identity;
 
-/** A saved pass belongs to this raw context, not merely to an identical opening message. */
-export function stateFitsContext(state: any, messages: readonly any[]): boolean {
-    if (state === undefined) return true;
+const branchIds = (entries: readonly any[]) => new Set(entries.map(entry => entry.id));
+
+function stateFitsIds(state: any, present: Set<string>): boolean {
     if (!Array.isArray(state?.blocks)) return false;
-    const present = new Set(branchEntries(messages).map((entry) => entry.id));
-    const contains = (id: unknown) => typeof id === "string" && present.has(id.split("#", 1)[0]);
+    const contains = (id: unknown) => {
+        if (typeof id !== "string") return false;
+        const split = id.indexOf("#");
+        return present.has(split < 0 ? id : id.slice(0, split));
+    };
     if (state.lastPassIds !== undefined && (!Array.isArray(state.lastPassIds) || !state.lastPassIds.every(contains))) return false;
     // The kernel deliberately retains inactive history whose messages are no longer present.
     return state.blocks.every((block: any) => !block.active
         || (Array.isArray(block.effectiveMessageIds) && block.effectiveMessageIds.every(contains)));
 }
 
+/** A saved pass belongs to this raw context, not merely to an identical opening message. */
+export function stateFitsContext(state: any, messages: readonly any[]): boolean {
+    return state === undefined || (Array.isArray(state?.blocks) && stateFitsIds(state, branchIds(branchEntries(messages))));
+}
+
 /** Exact fit, or the one documented lossless host alias. Never the terminal import's 90% rule. */
-export function compatibleState(state: any, messages: readonly any[]) {
-    if (stateFitsContext(state, messages)) return { state, migrated: false, reason: "complete-fit" };
-    const candidate = artifactIdentityCandidate(messages, state);
-    if (!stateFitsContext(state, candidate.messages)) return { reason: "saved-pass-or-active-ids-missing" };
+export function compatibleState(state: any, messages: readonly any[], entries?: readonly any[]) {
+    if (state === undefined) return { state, migrated: false, reason: "complete-fit" };
+    const current = entries ?? branchEntries(messages);
+    const present = branchIds(current);
+    if (stateFitsIds(state, present)) return { state, migrated: false, reason: "complete-fit" };
+    const candidate = artifactIdentityCandidate(messages, state, current);
+    if (!stateFitsIds(state, branchIds(candidate.entries))) return { reason: "saved-pass-or-active-ids-missing" };
     const translated = translateStateIds(state, candidate.aliases, candidate.origins);
-    if (!stateFitsContext(translated, messages)) return { reason: "artifact-mapping-incomplete" };
+    if (!stateFitsIds(translated, present)) return { reason: "artifact-mapping-incomplete" };
     return { state: translated, migrated: true, aliases: candidate.aliases, reason: "artifact-inline-alias" };
 }
 
@@ -140,14 +151,16 @@ export function stateIncludes(complete: any, subset: any) {
 
 /** A fresh fork may first be read in a different physical order. Only a complete, visible
  * checkpoint can supply its stable anchor; established native boundaries never call this. */
-export function checkpointContextId(file: string, messages: readonly any[], version: string) {
-    const ids = new Set(branchEntries(messages).map((entry: any) => entry.id));
+export function checkpointContextId(file: string, messages: readonly any[], version: string, entries?: readonly any[]) {
+    let ids: Set<string> | undefined;
     for (let index = messages.length - 1; index >= 0; index--) {
         const checkpoint = messages[index].role === "toolResult" && messages[index].details?.[CHECKPOINT_KEY];
         if (!checkpoint) continue;
         const state = checkpointState(file, checkpoint, version);
-        const compatible = state && compatibleState(state, messages);
-        if (compatible?.state !== undefined && (ids.has(checkpoint.contextId) || compatible.aliases?.has(checkpoint.contextId))) return checkpoint.contextId;
+        if (!state) continue;
+        entries ??= branchEntries(messages);
+        const compatible = compatibleState(state, messages, entries);
+        if (compatible.state !== undefined && ((ids ??= branchIds(entries)).has(checkpoint.contextId) || compatible.aliases?.has(checkpoint.contextId))) return checkpoint.contextId;
     }
 }
 
@@ -173,7 +186,7 @@ function checkpointInBoundary(checkpoint: any, sid: string, scope?: { epoch: num
 }
 
 /** Restore the newest checkpoint in a fork's inherited history; never replace state the fork already has. */
-function restoreCheckpoint(file: string, messages: readonly any[], version: string, deriveChildState: (state: any) => any, contextId?: string, scope?: { sid: string; epoch: number; replayFloor?: number }): string | undefined {
+function restoreCheckpoint(file: string, messages: readonly any[], entries: readonly any[], version: string, deriveChildState: (state: any) => any, contextId?: string, scope?: { sid: string; epoch: number; replayFloor?: number }): string | undefined {
     if ((readState(file)?.blocks.length ?? 0) > 0) return undefined;
     // Only checkpoints present at the fork cutoff can be selected.
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -192,7 +205,7 @@ function restoreCheckpoint(file: string, messages: readonly any[], version: stri
             continue;
         }
         // Head text can repeat after New context. Even a tagged checkpoint must fit the complete saved pass.
-        const compatible = compatibleState(source, messages);
+        const compatible = compatibleState(source, messages, entries);
         if (compatible.state === undefined) continue;
         source = compatible.state;
         const restored = {
@@ -611,10 +624,11 @@ export function createBridge(host: Host, bcp: any, version: string, options: { s
     async function prepare(request: any, hookApi: any, _context: any) {
         const sid = String(hookApi.conversationId);
         // Capture the actual fork-bounded history and restore it before rendering a prompt from saved summaries.
-        branches.set(sid, branchEntries(request.messages));
+        const entries = branchEntries(request.messages);
+        branches.set(sid, entries);
         if (!prepared.has(sid)) {
             try {
-                const source = restoreCheckpoint(sessionFile(sid), request.messages, version, deriveChildState, options.contextId, { ...options, sid });
+                const source = restoreCheckpoint(sessionFile(sid), request.messages, entries, version, deriveChildState, options.contextId, { ...options, sid });
                 if (source !== undefined) {
                     started.delete(sid);
                     host.notice("info", `Restored compression inherited from session ${source}.`, sid);

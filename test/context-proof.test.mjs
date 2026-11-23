@@ -52,6 +52,7 @@ test('ordered legacy empty/shrunk contexts reset once, while an ambiguous equal-
     const escaped = await store.observe(14, A, false, [`${A}:100`, `${B}:200`], { allowLegacyReset: true });
     assert.equal(escaped.epoch, 1);
     assert.equal(escaped.replayFloor, 1);
+    assert.deepEqual(await store.read(14), escaped); // Prime the parsed proof before changing only the pointer.
     const pointer = JSON.parse(await readFile(store.file(14), 'utf8'));
     delete pointer.replayFloor;
     await writeFile(store.file(14), JSON.stringify(pointer));
@@ -126,6 +127,7 @@ test('missing, malformed, tampered and symlinked proof objects never downgrade t
         await t.test(mode, async t => {
             const { root, store } = await fixture(t);
             const original = await store.observe(12, A, false, [`${A}:1`]);
+            assert.deepEqual(await store.read(12), original); // A warm reader must still check the proof on disk.
             const file = join(root, 'proofs', `${original.proof}.json`);
             const untouched = join(root, 'unrelated');
             await writeFile(untouched, 'DO_NOT_TOUCH');
@@ -135,6 +137,7 @@ test('missing, malformed, tampered and symlinked proof objects never downgrade t
             if (mode === 'symlink') { await rm(file); await symlink(untouched, file); }
             if (mode === 'directory-symlink') { await rm(join(root, 'proofs'), { recursive: true }); await symlink(untouched, join(root, 'proofs')); }
             await assert.rejects(new ContextEpochStore(root).read(12));
+            await assert.rejects(store.read(12));
             await assert.rejects(store.observe(12, A, false, [`${A}:1`]));
             assert.equal(await readFile(untouched, 'utf8'), 'DO_NOT_TOUCH');
             assert.equal(JSON.parse(await readFile(store.file(12), 'utf8')).epoch, 0);
