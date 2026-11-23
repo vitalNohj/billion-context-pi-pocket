@@ -101,6 +101,7 @@ function markerValue(value) {
 
 /** Request-message-only boundary witness. No unbounded native-head read is treated as request provenance. */
 export class ContextEpochStore {
+    #lastProof;
     constructor(root) { this.root = resolve(root); }
     file(id) {
         const value = String(id);
@@ -114,21 +115,29 @@ export class ContextEpochStore {
         try { text = await boundedRead(target, 4096, 'context-marker'); }
         catch (error) { if (error.code === 'ENOENT') return { epoch: 0 }; throw error; }
         const result = markerValue(JSON.parse(text));
-        if (result.proof) await this.proof(id, result); // A missing/tampered object never falls back to a head-only proof.
+        if (result.proof) await this.#proof(id, result); // A missing/tampered object never falls back to a head-only proof.
         return result;
     }
-    async proof(id, marker) {
-        if (!marker.proof) return undefined;
-        if (!HEX.test(marker.proof)) throw new Error('Invalid context-proof pointer');
+    async #proof(id, marker) {
+        const hash = marker.proof;
+        if (!hash) return undefined;
+        if (!HEX.test(hash)) throw new Error('Invalid context-proof pointer');
         const folder = join(this.root, 'proofs');
         if (!await directory(folder, false)) throw new Error('Missing context proof; explicit repair required');
-        const text = await boundedRead(join(folder, `${marker.proof}.json`), MAX_PROOF, 'context-proof');
-        if (createHash('sha256').update(text).digest('hex') !== marker.proof) throw new Error('Context proof hash mismatch; explicit repair required');
-        const proof = JSON.parse(text);
+        const text = await boundedRead(join(folder, `${hash}.json`), MAX_PROOF, 'context-proof');
+        if (createHash('sha256').update(text).digest('hex') !== hash) throw new Error('Context proof hash mismatch; explicit repair required');
+        // Consecutive boundary checks often read the same proof. Always verify the disk bytes
+        // and marker binding; only reuse private parsed data, without keeping it alive.
+        const cached = this.#lastProof?.hash === hash ? this.#lastProof.value.deref() : undefined;
+        const proof = cached ?? JSON.parse(text);
         if (proof.format !== 1 || proof.conversationId !== String(id) || proof.epoch !== marker.epoch || proof.head !== marker.head
-            || proof.boundary !== marker.boundary || proof.replayFloor !== marker.replayFloor || !Array.isArray(proof.instances) || proof.instances.some(entry => !Array.isArray(entry) || entry.length !== 3
+            || proof.boundary !== marker.boundary || proof.replayFloor !== marker.replayFloor) throw new Error('Invalid context proof');
+        if (!cached) {
+            if (!Array.isArray(proof.instances) || proof.instances.some(entry => !Array.isArray(entry) || entry.length !== 3
                 || typeof entry[0] !== 'string' || entry[0].length > 512 || typeof entry[1] !== 'string' || entry[1].length > 512 || !Number.isSafeInteger(entry[2]) || entry[2] <= 0)
-            || new Set(proof.instances.map(([id, time]) => JSON.stringify([id, time]))).size !== proof.instances.length) throw new Error('Invalid context proof');
+                || new Set(proof.instances.map(([id, time]) => JSON.stringify([id, time]))).size !== proof.instances.length) throw new Error('Invalid context proof');
+            this.#lastProof = { hash, value: new WeakRef(proof) };
+        }
         return proof;
     }
     async publish(id, next, instances, signal) {
@@ -168,12 +177,12 @@ export class ContextEpochStore {
             const value = JSON.parse(await boundedRead(join(folder, name), 4096, 'context-marker'));
             const marker = markerValue(value);
             if (name !== `${id}.${marker.epoch}.json`) throw new Error('Invalid archived context epoch');
-            if (value.format === 2 && marker.boundary === boundary) { await this.proof(id, marker); markers.push(marker); }
+            if (value.format === 2 && marker.boundary === boundary) { await this.#proof(id, marker); markers.push(marker); }
         }
         return markers.sort((a, b) => b.epoch - a.epoch);
     }
     async fits(id, marker, instances) {
-        const proof = await this.proof(id, marker);
+        const proof = await this.#proof(id, marker);
         return proof !== undefined && contains(proof.instances, multiset(instances));
     }
     async observe(id, head, reset = false, prefix, options = {}) {
@@ -194,7 +203,7 @@ export class ContextEpochStore {
             const split = value.lastIndexOf(':');
             return [value.slice(0, split), value.slice(split + 1)];
         }));
-        const old = await this.proof(id, previous);
+        const old = await this.#proof(id, previous);
         let verified = false;
         let legacyBoundary = false;
         if (!reset && instances !== undefined && old) verified = contains(old.instances, instances);

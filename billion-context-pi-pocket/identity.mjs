@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { types } from 'node:util';
 
 // Must match the pinned runtime's messageIdentity/stableLiveId. Never change these IDs on rollout.
 const REF_SOURCE = '(?:<acp\\s[^>]*>m\\d{5}</acp>|\\[m\\d{1,5}\\])';
@@ -22,13 +23,52 @@ export function normalize(value, message = false) {
     return out;
 }
 const hash = value => createHash('sha256').update(value).digest('hex');
+
+// Pi Durable reuses deep-frozen JSON from its committed context ranges. Do not trust a
+// shallow freeze or a length/role check: equal-length edits to text, arguments or details matter.
+const identities = new WeakMap();
+function frozenJson(value, ancestors) {
+    if (value === null || typeof value !== 'object') return typeof value !== 'function';
+    if (types.isProxy(value) || !Object.isFrozen(value) || ancestors?.has(value)) return false;
+    const array = Array.isArray(value);
+    const proto = Object.getPrototypeOf(value);
+    if (array ? proto !== Array.prototype : proto !== Object.prototype && proto !== null) return false;
+    const keys = Reflect.ownKeys(value);
+    if (array && keys.length !== value.length + 1) return false;
+    (ancestors ??= new Set()).add(value);
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        if (array && i === value.length && key === 'length') continue;
+        if (typeof key !== 'string' || (array && key !== String(i))) return false;
+        const field = Object.getOwnPropertyDescriptor(value, key);
+        if (!field.enumerable || !Object.hasOwn(field, 'value') || !frozenJson(field.value, ancestors)) return false;
+    }
+    ancestors.delete(value);
+    return true;
+}
+function memoFor(message) {
+    let memo = identities.get(message);
+    if (!memo && message !== null && typeof message === 'object' && frozenJson(message)) {
+        memo = { identity: undefined, hash: undefined, rank: -1, id: undefined, presentation: undefined };
+        identities.set(message, memo);
+    }
+    return memo ?? null; // Mutable hook outputs and older host messages take the uncached path.
+}
+const uncachedIdentity = message => JSON.stringify(normalize(message, true));
+function messageIdentity(message, memo = memoFor(message)) {
+    return memo ? (memo.identity ??= uncachedIdentity(message)) : uncachedIdentity(message);
+}
 export function branchEntries(messages) {
     const ranks = new Map();
     return messages.map(message => {
-        const identity = JSON.stringify(normalize(message, true));
+        const memo = memoFor(message);
+        const identity = messageIdentity(message, memo);
         const rank = ranks.get(identity) ?? 0;
         ranks.set(identity, rank + 1);
-        return { type: 'message', id: `live-${hash(`${identity}\0${rank}`).slice(0, 16)}`, parentId: null, timestamp: String(message.timestamp ?? 0), message };
+        // Retain just one ranked ID per object. The rank always comes from this request.
+        const id = memo?.rank === rank ? memo.id : `live-${hash(`${identity}\0${rank}`).slice(0, 16)}`;
+        if (memo) { memo.rank = rank; memo.id = id; }
+        return { type: 'message', id, parentId: null, timestamp: String(message.timestamp ?? 0), message };
     });
 }
 
@@ -40,17 +80,42 @@ export function artifactPresentation(message) {
         ? { ...part, name: 'artifact', arguments: { ...part.arguments, inline: true } } : part) };
 }
 
+function canonicalAssistant(message, rename) {
+    return { ...message, content: message.content.map(part => rename(part)
+        ? { ...part, name: 'artifact', arguments: { ...part.arguments, inline: true } } : part) };
+}
+
+function proofHash(message, paired) {
+    const memo = memoFor(message);
+    const rename = part => part.type === 'toolCall' && part.name === 'artifact_inline' && paired.has(part.id);
+    const result = message.role === 'toolResult' && message.toolName === 'artifact_inline' && paired.has(message.toolCallId);
+    const assistant = message.role === 'assistant' && Array.isArray(message.content);
+    const canonical = () => result ? artifactPresentation(message) : assistant ? canonicalAssistant(message, rename) : message;
+    if (!memo) return hash(uncachedIdentity(canonical()));
+    // An appended result can change the canonical form of an old call. The paired parts,
+    // not just the message object, must match before a presentation hash can be reused.
+    let variant = result ? 'result' : '';
+    if (assistant) message.content.forEach((part, i) => { if (rename(part)) variant += `${i},`; });
+    if (!variant) return memo.hash ??= hash(messageIdentity(message, memo));
+    if (memo.presentation?.variant !== variant) memo.presentation = { variant, hash: hash(uncachedIdentity(canonical())) };
+    return memo.presentation.hash;
+}
+
 /** Timestamp and duplicate count are separate from encounter-order ranks. No message text is persisted. */
 export function contextInstances(messages) {
-    const calls = new Set(messages.flatMap(message => message.role === 'assistant' && Array.isArray(message.content)
-        ? message.content.filter(part => part.type === 'toolCall' && part.name === 'artifact_inline' && typeof part.id === 'string' && part.id.length > 0 && !Object.hasOwn(part.arguments ?? {}, 'inline')).map(part => part.id) : []));
-    const paired = new Set(messages.filter(message => message.role === 'toolResult' && message.toolName === 'artifact_inline' && calls.has(message.toolCallId)).map(message => message.toolCallId));
-    return messages.filter(message => message.role !== 'system').map(message => {
-        const canonical = message.role === 'toolResult' && paired.has(message.toolCallId) ? artifactPresentation(message)
-            : message.role === 'assistant' && Array.isArray(message.content) ? { ...message, content: message.content.map(part => part.type === 'toolCall' && part.name === 'artifact_inline' && paired.has(part.id)
-                ? { ...part, name: 'artifact', arguments: { ...part.arguments, inline: true } } : part) } : message;
-        return [hash(JSON.stringify(normalize(canonical, true))), String(message.timestamp ?? 0)];
+    const calls = new Set();
+    messages.forEach(message => {
+        if (message.role !== 'assistant' || !Array.isArray(message.content)) return;
+        message.content.forEach(part => {
+            if (part.type === 'toolCall' && part.name === 'artifact_inline' && typeof part.id === 'string' && part.id.length > 0
+                && !Object.hasOwn(part.arguments ?? {}, 'inline')) calls.add(part.id);
+        });
     });
+    const paired = new Set();
+    messages.forEach(message => {
+        if (message.role === 'toolResult' && message.toolName === 'artifact_inline' && calls.has(message.toolCallId)) paired.add(message.toolCallId);
+    });
+    return messages.filter(message => message.role !== 'system').map(message => [proofHash(message, paired), String(message.timestamp ?? 0)]);
 }
 
 function savedRawIds(state) {
@@ -72,7 +137,7 @@ function savedRawIds(state) {
  * The complete saved-pass / active-ID fit must still prove the resulting assistant identities.
  * With no state, the all-legacy candidate is usable only when a retained digest proves it.
  */
-export function artifactIdentityCandidate(messages, state) {
+export function artifactIdentityCandidate(messages, state, current) {
     const calls = new Set(messages.flatMap(message => message.role === 'assistant' && Array.isArray(message.content)
         ? message.content.filter(part => part.type === 'toolCall' && part.name === 'artifact' && typeof part.id === 'string' && part.id.length > 0 && part.arguments?.inline === true).map(part => part.id) : []));
     const paired = new Set(messages.filter(message => message.role === 'toolResult' && message.toolName === 'artifact' && calls.has(message.toolCallId)).map(message => message.toolCallId));
@@ -85,7 +150,7 @@ export function artifactIdentityCandidate(messages, state) {
             return { ...part, name: 'artifact_inline', arguments: args };
         }) };
     });
-    const current = branchEntries(messages);
+    current ??= branchEntries(messages);
     let originals = reconstruct(paired);
     if (state !== undefined) {
         const saved = savedRawIds(state);
@@ -106,7 +171,7 @@ export function artifactIdentityCandidate(messages, state) {
     const aliases = new Map(old.flatMap((entry, i) => entry.id === current[i].id ? [] : [[entry.id, current[i].id]]));
     if (new Set(aliases.values()).size !== aliases.size) throw new Error('Ambiguous artifact identity migration');
     const origins = new Map(old.flatMap((entry, i) => entry.id === current[i].id ? [] : [[entry.id, {
-        before: JSON.stringify(normalize(originals[i], true)), after: JSON.stringify(normalize(messages[i], true)),
+        before: messageIdentity(originals[i]), after: messageIdentity(messages[i]),
     }]]));
     return { messages: originals, entries: old, aliases, origins };
 }
@@ -148,9 +213,10 @@ export function translateStateIds(state, aliases, origins = new Map()) {
 }
 
 /** Candidate old orders must still verify the original digest; saved-pass order is not trusted alone. */
-export function legacyOrders(messages, state) {
-    const current = branchEntries(messages.filter(message => message.role !== 'system'));
-    const old = artifactIdentityCandidate(messages.filter(message => message.role !== 'system'), state).entries;
+export function legacyOrders(messages, state, current) {
+    const history = messages.filter(message => message.role !== 'system');
+    current ??= branchEntries(history);
+    const old = artifactIdentityCandidate(history, state, current).entries;
     const candidates = [current, old];
     if (Array.isArray(state?.lastPassIds)) {
         const ids = [...new Set(state.lastPassIds.map(id => id.split('#', 1)[0]))];

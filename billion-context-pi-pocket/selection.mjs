@@ -38,14 +38,17 @@ export async function selectContext({ epochs, stateDir, sid, messages, bridge, v
     const before = await epochs.read(sid);
     if (expected && !sameMarker(before, expected)) throw new Error('Context changed while preparing request; retry with current context');
     const source = await stateAt(stateDir, sid, before.epoch);
-    const fit = bridge.compatibleState(source, messages);
     const entries = bridge.branchEntries(messages.filter(message => message.role !== 'system'));
+    // Coverage checks include system messages; the boundary proof does not. Share the branch
+    // only when both use the same input. Disk state and proof checks still run on every request.
+    const current = entries.length === messages.length ? entries : source === undefined ? undefined : bridge.branchEntries(messages);
+    const fit = bridge.compatibleState(source, messages, current);
     const prefix = entries.map(entry => `${entry.id}:${entry.timestamp}`);
     const instances = bridge.contextInstances(messages);
     const incompatibleLegacy = !before.proof && source !== undefined && fit.state === undefined;
-    const inheritedAnchor = before.head === undefined ? bridge.checkpointContextId(join(stateDir, `${sid}.jsonl`), messages, version) : undefined;
+    const inheritedAnchor = before.head === undefined ? bridge.checkpointContextId(join(stateDir, `${sid}.jsonl`), messages, version, current) : undefined;
     let boundary = await epochs.observe(sid, inheritedAnchor ?? entries[0]?.id, false, prefix, {
-        instances, legacyOrders: !before.proof && before.prefixHash ? bridge.legacyOrders(messages, source) : [], incompatibleLegacy, allowLegacyReset: restoreHistory, signal,
+        instances, legacyOrders: !before.proof && before.prefixHash ? bridge.legacyOrders(messages, source, entries) : [], incompatibleLegacy, allowLegacyReset: restoreHistory, signal,
         allocateEpoch: minimum => nextEpoch(epochs, stateDir, sid, minimum), expected: before,
         legacyHeadProved: !before.proof && !before.prefixHash && fit.aliases?.has(before.head),
     });
