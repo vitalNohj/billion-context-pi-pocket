@@ -68,7 +68,10 @@ test('linked runner keeps aliased compression through forks/restart and guarded 
     await app.setExtensionEnabled(h.owner(app), 'artifacts.ts', false);
     await app.setExtensionEnabled(h.owner(app), 'guard.ts', true);
     const { code } = app.runners.makeCode('Migration test computer', h.owner(app).id);
-    const linked = app.runners.redeem(code);
+    // Newer Pocket versions test the secure link with temporary keys; 0.27 redeems the code directly.
+    const secureLink = join(pocket!, 'src/runner/secure-link.ts');
+    const { linkInProcess } = existsSync(secureLink) ? await import(secureLink) : {};
+    const linked = linkInProcess ? linkInProcess(app.runners.redeem.bind(app.runners), code) : app.runners.redeem(code);
     const runnerOptions = { link: { server: `http://127.0.0.1:${(server.address() as any).port}`, ...linked },
         version: 'test', cwd: computer, log() {}, retryMs: [50, 100, 200], ask: async () => ({ allow: true }) };
     const connect = async () => {

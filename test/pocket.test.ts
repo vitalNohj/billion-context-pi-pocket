@@ -10,7 +10,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
 
-import { repo, ENTRY as ADAPTER, FILES as BUNDLE, SETTINGS, LEGACY_SETTINGS, dropInFolder } from "./fixtures.ts";
+import { repo, ENTRY as ADAPTER, FILES as BUNDLE, SETTINGS, LEGACY_SETTINGS, dropInFolder, legacyRuntimeVersion } from "./fixtures.ts";
 const pocketDir = process.env.PI_POCKET_CHECKOUT;
 const skip =
     pocketDir === undefined
@@ -277,7 +277,7 @@ test("branch entry IDs match billion-context-pi's own", { skip }, async () => {
         },
     ];
     // Use the deployed bundle, without the repository's development dependencies.
-    const { createRuntime } = await import(pathToFileURL(join(dataDir, "extensions", BUNDLE, `billion-context-pi-${mod.BCP_VERSION}`, "dist", "index.js")).href);
+    const { createRuntime } = await import(pathToFileURL(join(dataDir, "extensions", BUNDLE, `billion-context-pi-${legacyRuntimeVersion()}`, "dist", "index.js")).href);
     const ctx = {
         model: { contextWindow: 128000 },
         sessionManager: { getSessionId: () => "ids", getSessionFile: () => undefined, getBranch: () => [] },

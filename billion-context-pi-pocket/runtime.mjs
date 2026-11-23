@@ -16,7 +16,9 @@ const unzip = promisify(gunzip);
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 // Use an exact end assertion. JavaScript's $ also accepts a final line terminator.
 const HEX = /^[a-f0-9]{64}(?![\s\S])/;
-const VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?![\s\S])/;
+const VERSION = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))(?:-pocket\.([1-9][0-9]*))?(?![\s\S])/;
+const FORK_RELEASES = 'https://github.com/vitalNohj/billion-context-pi/releases/download';
+const FORK_ASSET_HOST = 'release-assets.githubusercontent.com';
 
 function operations() {
   if (!Object.hasOwn(globalThis, IN_FLIGHT)) {
@@ -27,19 +29,24 @@ function operations() {
   return map;
 }
 
-function stableVersion(version) {
-  if (typeof version !== 'string' || version.length > 128 || !VERSION.test(version)
-      || version.split('.').some(part => !Number.isSafeInteger(Number(part)))) {
-    throw new Error('Invalid stable runtime version');
+/** Stable versions come only from npm; Pocket patch releases come only from the reviewed fork. */
+export function runtimeRelease(version) {
+  const match = typeof version === 'string' && version.length <= 128 && VERSION.exec(version);
+  if (!match || match[1].split('.').some(part => !Number.isSafeInteger(Number(part)))
+      || (match[2] !== undefined && !Number.isSafeInteger(Number(match[2])))) {
+    throw new Error('Invalid runtime version');
   }
-  return version;
+  const file = `billion-context-pi-${version}.tgz`;
+  return match[2] === undefined
+    ? { baseVersion: version, tarball: `https://registry.npmjs.org/billion-context-pi/-/${file}` }
+    : { baseVersion: match[1], tarball: `${FORK_RELEASES}/v${version}/${file}`, redirectHost: FORK_ASSET_HOST };
 }
 
 /** Validate and snapshot a pin. Sizes are optional; unpackedBytes counts file payload bytes, as npm does. */
 export function validatePin(pin) {
   if (!pin || typeof pin !== 'object' || Array.isArray(pin)) throw new Error('Invalid runtime pin');
-  const version = stableVersion(pin.version);
-  const tarball = `https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-${version}.tgz`;
+  const version = pin.version;
+  const { tarball } = runtimeRelease(version);
   if (pin.tarball !== tarball) throw new Error('Invalid runtime tarball URL');
   const integrity = pin.integrity;
   if (typeof integrity !== 'string' || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(integrity)
@@ -247,7 +254,10 @@ function abortable(promise, signal) {
   });
 }
 
-async function download(pin, fetcher, callerSignal) {
+/** Download and verify an archive with the same source and byte checks for the installer and pin tools. */
+export async function downloadArchive(input, { fetcher = globalThis.fetch, signal: callerSignal } = {}) {
+  const pin = validatePin(input);
+  const { redirectHost } = runtimeRelease(pin.version);
   const controller = new AbortController();
   const cancel = () => controller.abort(callerSignal.reason);
   callerSignal?.addEventListener('abort', cancel, { once: true });
@@ -256,20 +266,36 @@ async function download(pin, fetcher, callerSignal) {
   timer.unref();
   let reader;
   let received;
-  try {
+  const cancelBody = response => {
+    try { Promise.resolve(response?.body?.cancel()).catch(() => {}); } catch { /* Preserve the download error. */ }
+  };
+  async function request(url, redirect) {
     aborted(controller.signal);
-    const request = Promise.resolve(fetcher(pin.tarball, { redirect: 'error', signal: controller.signal })).then(response => {
+    const pending = Promise.resolve(fetcher(url, { redirect, signal: controller.signal })).then(response => {
       if (controller.signal.aborted) {
-        try { Promise.resolve(response?.body?.cancel()).catch(() => {}); } catch { /* Preserve the abort reason. */ }
+        cancelBody(response);
         aborted(controller.signal);
       }
       return response;
     });
-    const response = await abortable(request, controller.signal);
-    received = response;
-    if (response.status !== 200 || response.redirected || (response.url && response.url !== pin.tarball)) {
-      throw new Error('Runtime download did not return the pinned URL with status 200');
+    received = await abortable(pending, controller.signal);
+    if (received.redirected || (received.url && received.url !== url)) throw new Error('Unexpected runtime download URL');
+    return received;
+  }
+  try {
+    let response = await request(pin.tarball, redirectHost ? 'manual' : 'error');
+    if (redirectHost && [301, 302, 303, 307, 308].includes(response.status)) {
+      let target;
+      try { target = new URL(response.headers.get('location')); } catch { /* Missing or invalid Location. */ }
+      if (target?.origin !== `https://${redirectHost}` || target.username || target.password || target.hash) {
+        throw new Error('Unexpected runtime release asset redirect');
+      }
+      // GitHub signs the asset URL. Keep its query, but never follow another redirect.
+      cancelBody(response);
+      received = undefined;
+      response = await request(target.href, 'error');
     }
+    if (response.status !== 200) throw new Error(`Runtime download failed: HTTP ${response.status}`);
     const lengthHeader = response.headers.get('content-length');
     let declared;
     if (lengthHeader !== null) {
@@ -300,7 +326,7 @@ async function download(pin, fetcher, callerSignal) {
     callerSignal?.removeEventListener('abort', cancel);
     try {
       if (reader) Promise.resolve(reader.cancel()).catch(() => {});
-      else if (received?.body) Promise.resolve(received.body.cancel()).catch(() => {});
+      else cancelBody(received);
     } catch { /* Cancellation must not hide the download error. */ }
     if (reader) {
       try { reader.releaseLock(); } catch { /* A canceled read can still be settling. */ }
@@ -427,7 +453,7 @@ function parseSelection(bytes) {
   if (selection.state === 'uninstalled' && keys === 'format,state') return { format: 1, state: 'uninstalled' };
   if (selection.state !== 'installed' || keys !== 'fingerprint,format,state,version'
       || typeof selection.fingerprint !== 'string' || !HEX.test(selection.fingerprint)) throw new Error('Invalid runtime selection');
-  stableVersion(selection.version);
+  runtimeRelease(selection.version);
   return { format: 1, state: 'installed', version: selection.version, fingerprint: selection.fingerprint };
 }
 
@@ -709,7 +735,8 @@ export class RuntimeStore {
       const bundlePath = path.join(this.#root, 'packages', id);
       const archiveExists = Boolean(await statIfPresent(archivePath));
       const bundleExists = Boolean(await statIfPresent(bundlePath));
-      const bytes = archiveExists ? (await readFile(archivePath, MAX_ARCHIVE)).bytes : await download(pin, this.#fetcher, signal);
+      const bytes = archiveExists ? (await readFile(archivePath, MAX_ARCHIVE)).bytes
+        : await downloadArchive(pin, { fetcher: this.#fetcher, signal });
       checkArchive(bytes, pin);
       aborted(signal);
       const parsed = await parseArchive(bytes);
@@ -881,8 +908,8 @@ export class RuntimeStore {
     const metadataBytes = parsed.files.get('package.json');
     if (!metadataBytes) throw new Error('Runtime package.json is missing');
     const metadata = JSON.parse(utf8.decode(metadataBytes));
-    const pin = validatePin({ version: metadata.version,
-      tarball: `https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-${metadata.version}.tgz`, integrity: integrityOf(bytes) });
+    const { tarball } = runtimeRelease(metadata.version);
+    const pin = validatePin({ version: metadata.version, tarball, integrity: integrityOf(bytes) });
     if (fingerprint(pin) !== id) throw new Error('Runtime cache fingerprint mismatch');
     checkMetadata(parsed, pin);
     return { pin, parsed };

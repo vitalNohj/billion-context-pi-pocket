@@ -1,10 +1,11 @@
 /**
  * Billion context for Pi Pocket. The gallery entry contains this integration, not the upstream program.
- * Only an owner's Install/Update action downloads the reviewed, hash-pinned upstream package.
+ * Only an owner's Install/Update action downloads the reviewed, hash-pinned engine package.
  * Per-chat controls and installation use public extension APIs. Pocket itself is not modified.
  *
  * Network use, only after an owner's click (or the desktop app acting as the owner):
- * - Install, Update, Reinstall, Repair: GET the pinned package from registry.npmjs.org. Nothing of the owner's is sent.
+ * - Install, Update, Reinstall, Repair: GET the pinned package from registry.npmjs.org or the vitalNohj GitHub
+ *   release (github.com redirects to release-assets.githubusercontent.com). Nothing of the owner's is sent.
  * - Check for updates: GET api.github.com/repos/vitalNohj/billion-context-pi-pocket/commits/main and its
  *   runtime-lock.json from raw.githubusercontent.com. Nothing of the owner's is sent. The extension never replaces its
  *   own files; the gallery, the desktop app, or the owner applies an update.
@@ -38,7 +39,7 @@ async function ownModule(name: string, dependencies: string[] = []) {
     const revision = hash([name, ...dependencies].map(part => `${part}\0${hash(readFileSync(join(files, part)))}`).join("\n"));
     return import(`${pathToFileURL(file).href}?sha256=${revision}`);
 }
-const { RuntimeStore, validatePin, fingerprint } = await ownModule("runtime.mjs");
+const { RuntimeStore, validatePin, fingerprint, runtimeRelease } = await ownModule("runtime.mjs");
 const { ContextEpochStore, sameMarker } = await ownModule("context.mjs");
 const { selectContext } = await ownModule("selection.mjs", ["context.mjs"]);
 const { UpdateState, installedSource } = await ownModule("updates.mjs");
@@ -94,6 +95,12 @@ if (new Set(pins.map((pin) => pin.version)).size !== pins.length) throw new Erro
 const currentPin = pins.find((pin) => pin.version === lock.current);
 if (!currentPin) throw new Error("Current runtime version is not reviewed");
 export const BCP_VERSION: string = currentPin.version;
+const currentRelease = runtimeRelease(BCP_VERSION);
+const downloadHost = new URL(currentPin.tarball).hostname;
+const versionLabel = (version: string) => {
+    const release = runtimeRelease(version);
+    return release.redirectHost ? `${release.baseVersion} + speed fix (vitalNohj fork)` : version;
+};
 const contract = json(join(files, "tool-contract.json"));
 if (contract.format !== 1 || contract.package !== "billion-context-pi" || contract.version !== BCP_VERSION
     || JSON.stringify(contract.tools?.map((tool: any) => tool.name)) !== JSON.stringify(TOOL_NAMES)
@@ -278,7 +285,8 @@ export default function billionContextPiPocket(host: Host, web?: any) {
         const reused = result?.key === key;
         if (!reused) {
             const options = { stateDir, extensionName, epoch: boundary.epoch, generation: boundary.generation ?? 0, replayFloor: boundary.replayFloor, contextId: boundary.head };
-            const extension = bridgeModule.createBridge(host, value.module, value.version, options);
+            // The speed-only fork uses the base release's saved state and checkpoint format.
+            const extension = bridgeModule.createBridge(host, value.module, runtimeRelease(value.version).baseVersion, options);
             result = { key, options, extension, generation: extension.hooks.find((item: any) => item.handlers.beforeRequest).handlers,
                 tools: extension.hooks.find((item: any) => item.handlers.beforeTool).handlers,
                 compaction: extension.hooks.find((item: any) => item.handlers.beforeCompact).handlers };
@@ -343,7 +351,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             const mode = await profile(api, api.conversationId, context);
             // Observe only the request's history, even while off; reject a race instead of reading a newer native head.
             const boundary = await selectContext({ epochs, stateDir, sid, messages: request.messages, bridge: bridgeModule,
-                version: BCP_VERSION, signal: context.abortSignal, expected, restoreHistory: !mode.enabled && mode.offBehavior === "restore-history", diagnostic });
+                version: currentRelease.baseVersion, signal: context.abortSignal, expected, restoreHistory: !mode.enabled && mode.offBehavior === "restore-history", diagnostic });
             if (!mode.enabled && mode.offBehavior === "restore-history") return { messages: withPrompt(request.messages,
                 "Billion context is off for this chat. Do not use its compression tools. Pocket manages context normally.") };
             const value = await kernel(api.conversationId, api, context, request.messages, true, boundary);
@@ -441,8 +449,10 @@ export default function billionContextPiPocket(host: Host, web?: any) {
             const extension = installedSource({ entryDir: here, helperDir: files, name: web.module ?? "billion-context-pi-pocket", version: BCP_VERSION });
             const stats = source === undefined ? undefined : await chatStats(source);
             return { runtime: { ...visible, managed: runtimeInfo.state === "installed", availableVersion: BCP_VERSION,
-                updateAvailable: runtimeInfo.installed && runtimeInfo.version !== BCP_VERSION,
-                downloadBytes: currentPin!.archiveBytes, diskBytes: currentPin!.unpackedBytes, host: "registry.npmjs.org" },
+                ...(runtimeInfo.installed ? { versionLabel: versionLabel(runtimeInfo.version) } : {}),
+                availableVersionLabel: versionLabel(BCP_VERSION), updateAvailable: runtimeInfo.installed && runtimeInfo.version !== BCP_VERSION,
+                downloadBytes: currentPin!.archiveBytes, diskBytes: currentPin!.unpackedBytes, host: downloadHost,
+                ...(currentRelease.redirectHost ? { redirectHost: currentRelease.redirectHost } : {}) },
                 extension, updates: updates.view(extension),
                 ...(session ? { session } : {}), ...(stats ? { stats } : {}), defaultOffBehavior: defaultBehavior() };
         }

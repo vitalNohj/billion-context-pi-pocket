@@ -8,6 +8,10 @@ import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { RuntimeStore, unpackArchive, validatePin, fingerprint } from '../billion-context-pi-pocket/runtime.mjs';
 
+const forkVersion = '1.2.3-pocket.1';
+const forkUrl = 'https://github.com/vitalNohj/billion-context-pi/releases/download/v1.2.3-pocket.1/billion-context-pi-1.2.3-pocket.1.tgz';
+const assetUrl = 'https://release-assets.githubusercontent.com/example.tgz?signature=test';
+
 function octal(number, width) {
   return `${number.toString(8).padStart(width - 1, '0')}\0`;
 }
@@ -80,7 +84,7 @@ function fixture(version = '1.2.3', extra = []) {
 function pinFor(bytes, version, unpackedBytes) {
   return {
     version,
-    tarball: `https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-${version}.tgz`,
+    tarball: version === forkVersion ? forkUrl : `https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-${version}.tgz`,
     integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}`,
     archiveBytes: bytes.length,
     ...(unpackedBytes === undefined ? {} : { unpackedBytes }),
@@ -189,6 +193,91 @@ test('validates strict stable pins and canonical SHA512 integrity', () => {
     for (const value of values) assert.throws(() => validatePin({ ...item.pin, [key]: value }), new RegExp(key));
   }
   for (const bad of [null, [], 'pin']) assert.throws(() => validatePin(bad), /pin/);
+});
+
+test('the fork pin accepts only the exact repository, versioned tag, and asset path', () => {
+  const { pin } = fixture(forkVersion);
+  assert.deepEqual(validatePin(pin), pin);
+  for (const tarball of [assetUrl, `${forkUrl}?download=1`, `${forkUrl}#file`, forkUrl.replace('github.com', 'github.com:443'),
+    forkUrl.replace('vitalNohj', 'another-owner'), forkUrl.replace('v1.2.3-pocket.1', 'v1.2.3-pocket.2'),
+    forkUrl.replace('/billion-context-pi-1.2.3-pocket.1.tgz', '/other.tgz')]) {
+    assert.throws(() => validatePin({ ...pin, tarball }), /tarball URL/);
+  }
+  for (const version of ['1.2.3-pocket.01', '1.2.3-pocket.0', '1.2.3-pocket.1\n']) {
+    assert.throws(() => validatePin({ ...pin, version }), /runtime version/);
+  }
+});
+
+function forkFetcher(item, calls) {
+  return async (url, { redirect, signal }) => {
+    calls.push(url);
+    assert.ok(signal instanceof AbortSignal);
+    if (url === item.pin.tarball) {
+      assert.equal(redirect, 'manual');
+      return new Response(null, { status: 302, headers: { location: assetUrl } });
+    }
+    assert.equal(url, assetUrl);
+    assert.equal(redirect, 'error');
+    return response(item.bytes);
+  };
+}
+
+test('the installer rejects redirects outside the single HTTPS asset host and rejects a second hop', async t => {
+  const { pin } = fixture(forkVersion);
+  for (const location of [undefined, 'http://release-assets.githubusercontent.com/a',
+    'https://objects.githubusercontent.com/a', 'https://release-assets.githubusercontent.com.evil.test/a',
+    'https://release-assets.githubusercontent.com:444/a', 'https://user@release-assets.githubusercontent.com/a',
+    'https://registry.npmjs.org/a', `${assetUrl}#fragment`]) {
+    await t.test(location ?? 'missing Location', async t => {
+      const { store } = await environment(t, async (url, options) => {
+        assert.equal(url, forkUrl, 'an unexpected hostname must not receive a request');
+        assert.equal(options.redirect, 'manual');
+        return new Response(null, { status: 302, headers: location === undefined ? {} : { location } });
+      });
+      await assert.rejects(store.install(pin), /Unexpected runtime release asset redirect/);
+      assert.equal(await store.selection(), null);
+    });
+  }
+  const urls = [];
+  const { store } = await environment(t, async (url, { redirect }) => {
+    urls.push(url);
+    assert.equal(redirect, url === forkUrl ? 'manual' : 'error');
+    return new Response(null, { status: 302, headers: { location: assetUrl } });
+  });
+  await assert.rejects(store.install(pin), /HTTP 302/);
+  assert.deepEqual(urls, [forkUrl, assetUrl]);
+  assert.equal(await store.selection(), null);
+});
+
+test('a fork download with the wrong SHA512, archive size, or unpacked size cannot activate', async t => {
+  const item = fixture(forkVersion);
+  for (const [change, error] of [[{ integrity: fixture().pin.integrity }, /integrity mismatch/],
+    [{ archiveBytes: item.pin.archiveBytes + 1 }, /archive size mismatch/],
+    [{ unpackedBytes: item.pin.unpackedBytes + 1 }, /unpacked size mismatch/]]) {
+    const urls = [];
+    const { store } = await environment(t, forkFetcher(item, urls));
+    await assert.rejects(store.install({ ...item.pin, ...change }), error);
+    assert.deepEqual(urls, [forkUrl, assetUrl]);
+    assert.equal(await store.selection(), null);
+  }
+});
+
+test('a reviewed npm pin still installs and can replace the fork during repair', async t => {
+  const npm = fixture();
+  const fork = fixture(forkVersion);
+  const forkUrls = [], npmCalls = [];
+  const { store } = await environment(t, (url, options) => url === npm.pin.tarball
+    ? serve(npm, npmCalls)(url, options) : forkFetcher(fork, forkUrls)(url, options));
+  await store.install(npm.pin);
+  await assertSelected(store, npm.pin);
+  await store.install(fork.pin);
+  await assertSelected(store, fork.pin);
+  await store.repair(npm.pin);
+  await assertSelected(store, npm.pin);
+  assert.equal(npmCalls.length, 1, 'the reviewed npm archive is still cached');
+  assert.deepEqual(forkUrls, [forkUrl, assetUrl]);
+  await store.uninstall();
+  assert.equal((await store.status([npm.pin, fork.pin])).state, 'uninstalled');
 });
 
 test('installs unchanged full package bytes, then resolves and loads a cached pin offline', async t => {
@@ -494,7 +583,7 @@ test('rejects redirect responses and truncated Content-Length bodies', async t =
     async () => ({ status: 200, redirected: false, url: 'https://evil.test/archive.tgz' }),
   ]) {
     const store = new RuntimeStore({ root: env.root, nodeModules: env.nodeModules, fetcher });
-    await assert.rejects(store.install(item.pin), /pinned URL/);
+    await assert.rejects(store.install(item.pin), /Unexpected runtime download URL|HTTP 302/);
     assert.equal(await store.selection(), null);
   }
   const short = new RuntimeStore({ root: env.root, nodeModules: env.nodeModules,

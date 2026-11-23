@@ -18,13 +18,37 @@ export async function filesUnder(directory, prefix = "") {
 }
 
 export async function bundledPackageNames(packageDir) {
+    const dist = join(packageDir, "dist");
+    const code = await Promise.all((await filesUnder(dist)).filter((file) => file.endsWith(".js")).map((file) => readFile(join(dist, file), "utf8")));
+    return bundledNames(code);
+}
+
+export function bundledNames(code) {
     const names = new Set();
-    for (const file of await filesUnder(join(packageDir, "dist"))) {
-        if (!file.endsWith(".js")) continue;
-        const code = await readFile(join(packageDir, "dist", file), "utf8");
+    for (const text of code) {
         // Upstream's unminified tsup output identifies the bundled source modules.
-        for (const match of code.matchAll(/^\/\/ node_modules\/((?:@[^/]+\/)?[^/]+)\//gm)) names.add(match[1]);
+        for (const match of text.matchAll(/^\/\/ node_modules\/((?:@[^/]+\/)?[^/]+)\//gm)) names.add(match[1]);
     }
     if (names.size === 0) throw new Error("Cannot identify bundled libraries; review the upstream build format");
     return [...names].sort();
+}
+
+/** Compare the actual dep sources included in both release builds, not only their package.json ranges. */
+export function bundledSources(files) {
+    const sources = new Map();
+    for (const [file, bytes] of files) {
+        if (!file.startsWith("dist/") || !file.endsWith(".js.map")) continue;
+        const map = JSON.parse(bytes);
+        if (!Array.isArray(map.sources) || map.sources.length !== map.sourcesContent?.length) throw new Error(`Incomplete source map: ${file}`);
+        for (const [i, name] of map.sources.entries()) {
+            if (!name.startsWith("../node_modules/")) continue;
+            const content = map.sourcesContent[i];
+            if (typeof content !== "string" || (sources.has(name) && sources.get(name) !== content)) {
+                throw new Error(`Invalid bundled source: ${name}`);
+            }
+            sources.set(name, content);
+        }
+    }
+    if (!sources.size) throw new Error("Cannot verify bundled libraries without their source maps");
+    return sources;
 }

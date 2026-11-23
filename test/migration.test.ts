@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
-import { dropInFolder, FILES } from './fixtures.ts';
+import { dropInFolder, FILES, legacyRuntimeVersion } from './fixtures.ts';
 import { ContextEpochStore, digest } from '../billion-context-pi-pocket/context.mjs';
 import { artifactPresentation, branchEntries, contextInstances, normalize, translateStateIds } from '../billion-context-pi-pocket/identity.mjs';
 const pocket = process.env.PI_POCKET_CHECKOUT;
@@ -86,7 +86,7 @@ async function fixture(t: any, name = 'migration') {
                 conversationRoute(method: string, path: string, fn: any) { routes.set(`${method} ${path}`, fn); } });
             return { defaults, status: () => routes.get('GET status/:source')({ ...api, context, conversation: { id: api.conversationId } }) };
         },
-        damageRuntime() { writeFileSync(join(folder, FILES, 'billion-context-pi-0.1.83/dist/index.js'), 'broken reviewed program fixture'); },
+        damageRuntime() { writeFileSync(join(folder, FILES, `billion-context-pi-${legacyRuntimeVersion()}/dist/index.js`), 'broken reviewed program fixture'); },
         response: (message: any) => handlers().afterResponse(message, api, context),
         toolHooks,
     };
@@ -409,7 +409,7 @@ test('version-1 inline checkpoint aliases restore before a paused prompt; wrong 
     const sourceManifest = JSON.parse(readFileSync(join(f.stateDir, 'checkpoints', `${v2.stateId}.json`), 'utf8'));
     const { blockIds, ...sourceFields } = sourceManifest;
     const sourceState = { ...sourceFields, blocks: blockIds.map((id: string) => JSON.parse(readFileSync(join(f.stateDir, 'checkpoints', `${id}.json`), 'utf8'))) };
-    const v1 = { version: 1, bcpVersion: '0.1.83', conversationId: f.sid, contextId: f.marker().head, state: sourceState };
+    const v1 = { version: 1, bcpVersion: legacyRuntimeVersion(), conversationId: f.sid, contextId: f.marker().head, state: sourceState };
     const modern = await f.migrated(messages);
     // Keep the complete saved pass, but no compress calls that could hide a failed restore by replaying.
     const base = modern.filter((message: any) => message.role === 'assistant'

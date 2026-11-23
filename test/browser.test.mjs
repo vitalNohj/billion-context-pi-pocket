@@ -65,6 +65,21 @@ test("the same three actions as the desktop app: install, uninstall, check for u
     button(active.tree, "Check for updates").props.onClick();
     assert.deepEqual(active.calls, ["runtime/repair", "updates/check"]);
 });
+test("Install and Update name the fork and both download hosts", { skip }, () => {
+    const label = "0.1.83 + speed fix (vitalNohj fork)";
+    for (const state of ["absent", "installed"]) {
+        const data = status({ state });
+        Object.assign(data.runtime, { availableVersion: "0.1.83-pocket.1", availableVersionLabel: label,
+            host: "github.com", redirectHost: "release-assets.githubusercontent.com", updateAvailable: data.runtime.installed });
+        if (!data.runtime.installed) delete data.runtime.version;
+        const result = draw(data);
+        assert.equal(model(data).version, data.runtime.installed ? "0.1.83" : label);
+        assert.ok(text(result.tree).includes(`Downloads ${label} from github.com (served by release-assets.githubusercontent.com)`));
+        button(result.tree, data.runtime.installed ? "Update" : "Install").props.onClick();
+        assert.deepEqual(result.calls, ["runtime/install"]);
+    }
+});
+
 test("an uninstalled program offers Install without a redundant Uninstall action", { skip }, () => {
     const result = draw(status({ state: "uninstalled", installed: false, managed: false }));
     assert.ok(button(result.tree, "Install"));

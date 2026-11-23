@@ -1,7 +1,7 @@
 {
   "format": 1,
   "package": "billion-context-pi",
-  "version": "0.1.83",
+  "version": "0.1.83-pocket.1",
   "tools": [
     {
       "name": "compress",

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { downloadArchive, validatePin } from '../billion-context-pi-pocket/runtime.mjs';
 
 // This is test data, not an extension installer. A clean checkout has no pin-generation cache.
 // Acquire the reviewed archive once before tests replace fetch to count owner-action downloads.
@@ -23,24 +24,13 @@ async function acquire(pin, cacheDir, fetcher) {
         // Do not hide corruption, permission failures, or unexpected cache objects.
         if (error.code !== 'ENOENT') throw error;
     }
-    const response = await fetcher(pin.tarball, { redirect: 'error', signal: AbortSignal.timeout(15_000) });
-    assert.ok(response.ok, `Pinned test archive request failed: HTTP ${response.status}`);
-    assert.ok(response.body, 'Pinned test archive response has no body');
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of response.body) {
-        size += chunk.byteLength;
-        assert.ok(size <= pin.archiveBytes, 'Pinned test archive response exceeds the reviewed size');
-        chunks.push(Buffer.from(chunk));
-    }
-    return verify(Buffer.concat(chunks, size), pin);
+    return downloadArchive(pin, { fetcher, signal: AbortSignal.timeout(30_000) });
 }
 
 /** Read a verified pin-generation cache, or fetch the same immutable test archive on a clean machine. */
-export async function pinnedTestArchive(pin, { cacheDir, fetcher = globalThis.fetch }) {
-    assert.match(pin.integrity, /^sha512-[A-Za-z0-9+/]{86}==$/);
-    assert.ok(Number.isSafeInteger(pin.archiveBytes) && pin.archiveBytes > 0);
-    assert.equal(new URL(pin.tarball).protocol, 'https:');
+export async function pinnedTestArchive(input, { cacheDir, fetcher = globalThis.fetch }) {
+    const pin = validatePin(input);
+    assert.ok(pin.archiveBytes, 'Test archive must have a reviewed size');
     const key = JSON.stringify([cacheDir, pin.tarball, pin.integrity, pin.archiveBytes]);
     let promise = pending.get(key);
     if (!promise) {
