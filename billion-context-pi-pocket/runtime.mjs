@@ -287,7 +287,7 @@ export async function downloadArchive(input, { fetcher = globalThis.fetch, signa
     if (redirectHost && [301, 302, 303, 307, 308].includes(response.status)) {
       let target;
       try { target = new URL(response.headers.get('location')); } catch { /* Missing or invalid Location. */ }
-      if (target?.origin !== `https://${redirectHost}` || target.username || target.password || target.hash) {
+      if (target?.protocol !== 'https:' || target.origin !== `https://${redirectHost}` || target.username || target.password || target.hash) {
         throw new Error('Unexpected runtime release asset redirect');
       }
       // GitHub signs the asset URL. Keep its query, but never follow another redirect.

@@ -40,7 +40,7 @@ async function verified(integrity, download) {
 }
 async function npmDependency(url, integrity) {
     const parsed = new URL(url);
-    if (parsed.origin !== 'https://registry.npmjs.org' || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('Unexpected tarball host');
+    if (parsed.protocol !== 'https:' || parsed.origin !== 'https://registry.npmjs.org' || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('Unexpected tarball host');
     return verified(integrity, async () => {
         const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(30_000) });
         if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);

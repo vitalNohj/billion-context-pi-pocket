@@ -225,7 +225,7 @@ function forkFetcher(item, calls) {
 test('the installer rejects redirects outside the single HTTPS asset host and rejects a second hop', async t => {
   const { pin } = fixture(forkVersion);
   for (const location of [undefined, 'http://release-assets.githubusercontent.com/a',
-    'https://objects.githubusercontent.com/a', 'https://release-assets.githubusercontent.com.evil.test/a',
+    'blob:https://release-assets.githubusercontent.com/example', 'https://objects.githubusercontent.com/a', 'https://release-assets.githubusercontent.com.evil.test/a',
     'https://release-assets.githubusercontent.com:444/a', 'https://user@release-assets.githubusercontent.com/a',
     'https://registry.npmjs.org/a', `${assetUrl}#fragment`]) {
     await t.test(location ?? 'missing Location', async t => {
