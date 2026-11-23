@@ -1,6 +1,7 @@
 import { readFile, appendFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { runtimeRelease, validatePin } from "../billion-context-pi-pocket/runtime.mjs";
 
 export const root = fileURLToPath(new URL("../", import.meta.url));
 export const repository = "ranxianglei/billion-context-pi";
@@ -20,6 +21,16 @@ export function isNewer(candidate, current) {
         if (a[i] !== b[i]) return a[i] > b[i];
     }
     return false;
+}
+
+export function reviewedFork(upstream) {
+    if (upstream.pocketFork === undefined) return undefined;
+    const pin = validatePin(upstream.pocketFork);
+    const { baseVersion, redirectHost } = runtimeRelease(pin.version);
+    if (!redirectHost || baseVersion !== stableVersion(upstream.version)) {
+        throw new Error("The Pocket fork must patch the reviewed npm release");
+    }
+    return pin;
 }
 
 export async function fetchJSON(url) {

@@ -1,7 +1,7 @@
 {
   "format": 1,
   "package": "billion-context-pi",
-  "current": "0.1.83",
+  "current": "0.1.83-pocket.1",
   "releases": [
     {
       "version": "0.1.83",
@@ -14,6 +14,19 @@
         "dist/contract.js": "72e8b00f4b2c9e746d4479b72be5c54ad898e5320840c7ec6493b272feb1adb2",
         "dist/index.js": "386de06a8272913a90088d9d219d7abefaed9d46529f7d102435a5a3d094bba0",
         "package.json": "ec42091501ccc90f76155cf68b17c1ad9338405a3aca4896f713aa1b70fcfd1e"
+      }
+    },
+    {
+      "version": "0.1.83-pocket.1",
+      "tarball": "https://github.com/vitalNohj/billion-context-pi/releases/download/v0.1.83-pocket.1/billion-context-pi-0.1.83-pocket.1.tgz",
+      "integrity": "sha512-1E5Jm0xTjl6L5OqVGiw15aKhav9Pj4WcH2X/yOj5OhfZ/kOok5RVmT2BcCjv01HN5DSGj3LsRJ9RAeiWdy2c+g==",
+      "archiveBytes": 970612,
+      "unpackedBytes": 4039679,
+      "executableFiles": {
+        "dist/chunk-YIQBCVMW.js": "ffd9592a0b40a13bef3991b514d7ccc8b2316fb69663691836580df00509319e",
+        "dist/contract.js": "9c6091cff5d4dc4b0dfda3aa4a624f00706f04430c7e0c004d6148456c1ebae7",
+        "dist/index.js": "9c9a2e9ea72839348e97a869343b73f95515537881d23483fb5c2533c234733b",
+        "package.json": "5171660ceb6db661261e1e575fd837fdaca5b24a0bc1482e2ee7941614a6aa2e"
       }
     }
   ]

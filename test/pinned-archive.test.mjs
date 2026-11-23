@@ -12,7 +12,8 @@ async function fixture(t) {
     const bytes = Buffer.from('the exact reviewed archive bytes');
     const digest = createHash('sha512').update(bytes).digest();
     const pin = {
-        tarball: 'https://registry.npmjs.org/bcp-fixture/-/bcp-fixture-1.0.0.tgz',
+        version: '1.0.0',
+        tarball: 'https://registry.npmjs.org/billion-context-pi/-/billion-context-pi-1.0.0.tgz',
         integrity: `sha512-${digest.toString('base64')}`,
         archiveBytes: bytes.length,
     };
@@ -86,7 +87,7 @@ test('unverified downloaded data never becomes reusable test data', async t => {
             const bad = Buffer.from(f.bytes);
             bad[0] ^= 0xff;
             const fetcher = async () => new Response(kind === 'short' ? bad.subarray(1) : bad);
-            await assert.rejects(pinnedTestArchive(f.pin, { cacheDir: f.cacheDir, fetcher }), /does not match the reviewed pin/);
+            await assert.rejects(pinnedTestArchive(f.pin, { cacheDir: f.cacheDir, fetcher }), /Runtime archive (size|integrity) mismatch/);
         });
     }
 });
@@ -100,7 +101,7 @@ test('an oversized archive stream is cancelled before buffering beyond the revie
     });
     await assert.rejects(pinnedTestArchive(f.pin, {
         cacheDir: f.cacheDir, fetcher: async () => new Response(stream),
-    }), /exceeds the reviewed size/);
+    }), /exceeds the compressed size limit/);
     assert.equal(cancelled, true);
 });
 

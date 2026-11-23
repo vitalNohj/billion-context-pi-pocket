@@ -49,6 +49,19 @@ test("a check saves the newest commit and its pinned version; no request before 
     assert.equal(state.view({ version: "0.1.83" }).available, true);
 });
 
+test("an update check accepts the reviewed fork version and a return to npm", async (t) => {
+    const root = folder(t);
+    const installed = { version: "0.1.83" };
+    const fork = new UpdateState({ root, fetcher: github(B, "0.1.83-pocket.1") });
+    await fork.check();
+    assert.deepEqual(fork.view(installed).latest, { commit: B, version: "0.1.83-pocket.1" });
+    assert.equal(fork.view(installed).available, true);
+    const npm = new UpdateState({ root, fetcher: github(A, "0.1.83") });
+    await npm.check();
+    assert.equal(npm.view({ version: "0.1.83-pocket.1" }).available, true);
+    await assert.rejects(new UpdateState({ root, fetcher: github(B, "0.1.83-rc.1") }).check(), /no valid runtime-lock/);
+});
+
 test("a failed check keeps the last result and records the error", async (t) => {
     const root = folder(t);
     await new UpdateState({ root, fetcher: github(B, "0.1.84") }).check();

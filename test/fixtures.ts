@@ -7,17 +7,17 @@ export const ENTRY = "billion-context-pi-pocket.ts";
 export const FILES = "billion-context-pi-pocket";
 export const SETTINGS = "billion-context-pi-pocket.json";
 export const LEGACY_SETTINGS = "billion-context-pi-pocket-adapter.json";
+const npmRuntime = join(repo, "node_modules", "billion-context-pi");
+export const legacyRuntimeVersion = () => JSON.parse(readFileSync(join(npmRuntime, "package.json"), "utf8")).version;
 
 export function dropInFolder(folder: string, settings: Record<string, string> = {}, includeLegacy = true, settingsFile = SETTINGS): string {
     mkdirSync(folder, { recursive: true });
     copyFileSync(join(repo, ENTRY), join(folder, ENTRY));
     cpSync(join(repo, FILES), join(folder, FILES), { recursive: true });
     if (includeLegacy) {
-        const { current } = JSON.parse(readFileSync(join(repo, FILES, "runtime-lock.json"), "utf8"));
-        const source = join(repo, "node_modules", "billion-context-pi");
-        cpSync(source, join(folder, FILES, `billion-context-pi-${current}`), {
+        cpSync(npmRuntime, join(folder, FILES, `billion-context-pi-${legacyRuntimeVersion()}`), {
             recursive: true,
-            filter: (path) => !relative(source, path).split(/[\\/]/).includes("node_modules"),
+            filter: (path) => !relative(npmRuntime, path).split(/[\\/]/).includes("node_modules"),
         });
     }
     writeFileSync(join(folder, settingsFile), JSON.stringify(settings));

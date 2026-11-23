@@ -39,9 +39,10 @@ export function model(data, failed = false) {
         : 'Not installed';
     const detail = program.state === 'error' ? program.error
         : program.state === 'uninstalled' ? 'Pocket manages context normally. Your saved history stays.'
-        : !active ? `Downloads ${bytes(program.downloadBytes)} from ${program.host}. No install scripts run.`
         : program.state === 'legacy' ? 'Using the copy bundled with an older version. Install switches to the managed copy.'
         : null;
+    const target = program.availableVersionLabel ?? program.availableVersion;
+    const host = program.redirectHost ? `${program.host} (served by ${program.redirectHost})` : program.host;
     // One primary action, named as the desktop app names it.
     const extensionUpdate = updates?.available === true && extension?.source === 'desktop';
     const primary = extensionUpdate ? { label: 'Update', path: 'updates/request', busy: 'Asking the desktop app to update' }
@@ -63,7 +64,9 @@ export function model(data, failed = false) {
             : extension?.source === 'gallery' ? `${next} is in the repository. Menu → Extensions → Updates offers it after gallery review.`
             : `${next} is available. These files were copied by hand: replace them to update.` };
     } else if (updates?.checkedAt) update = { tone: 'muted', text: `Up to date · checked ${ago(updates.checkedAt)}` };
-    return { program, extension, state, title, detail, primary, canUninstall, update, version: program.version ?? program.availableVersion };
+    return { program, extension, state, title, detail, primary, canUninstall, update, target, host,
+        version: program.versionLabel ?? program.version ?? target,
+        download: primary.path === 'runtime/install' ? `Downloads ${target} from ${host} (${bytes(program.downloadBytes)}). No install scripts run.` : null };
 }
 
 /** The sheet's markup. `ui` holds the transient state; `on` the handlers. */
@@ -91,6 +94,7 @@ export function view(html, pocket, data, ui, on) {
                 </div>
             </div>
             ${m.detail && html`<p class=${m.state === 'error' ? 'bcp-note bcp-err' : 'bcp-note muted small'}>${m.detail}</p>`}
+            ${m.download && html`<p class="bcp-note muted small">${m.download}</p>`}
             ${ui.busy || m.program.busy ? html`<div class="bcp-busy"><${pocket.Loader} label=${ui.busy || 'Another installation is in progress'} /></div>` : null}
             ${ui.confirmRemove ? html`<div class="bcp-confirm" role="alertdialog" aria-label="Confirm uninstall">
                 <p>Remove the downloaded program? Your chats, compression history, and settings stay. Pocket manages context normally until you install it again.</p>
@@ -140,7 +144,7 @@ export function view(html, pocket, data, ui, on) {
             <div class="bcp-more-body small muted">
                 <p>Uses ${CREDITS.map(([name, url], i) => html`${i ? ' and ' : ''}<a href=${url} target="_blank" rel="noopener noreferrer">${name}</a>`)} by ranxianglei.
                     The default off behavior is in Menu → Extensions, in this extension’s settings.</p>
-                ${m && html`<p>Install uses reviewed version ${m.program.availableVersion}, pinned by hash. It downloads ${bytes(m.program.downloadBytes)} from ${m.program.host} and needs about ${bytes(2 * ((m.program.downloadBytes || 0) + (m.program.diskBytes || 0)))} while it installs.</p>`}
+                ${m && html`<p>Install uses ${m.target}, pinned by hash. It downloads ${bytes(m.program.downloadBytes)} from ${m.host} and needs about ${bytes(2 * ((m.program.downloadBytes || 0) + (m.program.diskBytes || 0)))} while it installs.</p>`}
                 <pre class="mono">${ui.licenses ?? 'Loading notices…'}</pre>
             </div>
         </details>

@@ -3,6 +3,11 @@
   "repository": "ranxianglei/billion-context-pi",
   "commit": "1cb6340df262933c8e640a7f45e19a7b34fe1ed8",
   "npmIntegrity": "sha512-122CcPmZvC5Yqqbj75UMppOFlkdAN8kbzvJ4OugV6xBPW6wbiHbaZ9YDYWQwDy4hJ/Vc98eOREGkWLWKflbnZw==",
+  "pocketFork": {
+    "version": "0.1.83-pocket.1",
+    "tarball": "https://github.com/vitalNohj/billion-context-pi/releases/download/v0.1.83-pocket.1/billion-context-pi-0.1.83-pocket.1.tgz",
+    "integrity": "sha512-1E5Jm0xTjl6L5OqVGiw15aKhav9Pj4WcH2X/yOj5OhfZ/kOok5RVmT2BcCjv01HN5DSGj3LsRJ9RAeiWdy2c+g=="
+  },
   "bundledDependencies": {
     "@earendil-works/pi-tui": {
       "version": "0.83.0",

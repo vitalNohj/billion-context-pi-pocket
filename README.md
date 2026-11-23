@@ -44,7 +44,7 @@ The menu is available without the BCP program installed, so you can install or r
 - **This chat:** the on/off switch, the off behavior, and counts of the chat's saved summaries (never their text).
 - **About and licenses:** the upstream and dependency attribution, including the additional acp-kernel attribution terms.
 
-A failed download or pre-activation check does not replace a working program. Install and repair do not run npm lifecycle scripts. The program downloads from `registry.npmjs.org`; its exact version, URL, archive size, and SHA512 are recorded in [`runtime-lock.json`](billion-context-pi-pocket/runtime-lock.json). The menu shows the version and estimated space before installation.
+A failed download or pre-activation check does not replace a working program. Install and repair do not run npm lifecycle scripts. The **0.1.83 + speed fix (vitalNohj fork)** version downloads from the reviewed release on `github.com`, which redirects once to `release-assets.githubusercontent.com`. The unpatched version and other npm pins download from `registry.npmjs.org`. Exact versions, URLs, sizes, and SHA512 digests are recorded in [`runtime-lock.json`](billion-context-pi-pocket/runtime-lock.json). The menu shows the version, download hosts, and estimated space before installation.
 
 Successful versions stay cached until Uninstall. Repairs can retain additional recovery backups. An abrupt process stop during repair can leave recovery files; they are not automatically deleted or blindly restored over newer files.
 
@@ -158,7 +158,7 @@ The upstream self-updater is disabled with `ACP_AUTO_UPDATE=0`. Pocket forks use
 
 ## Updates and gallery review
 
-The **Refresh pins** GitHub workflow checks published npm releases every 6 hours. It verifies provenance and licenses, captures the tool contract, and runs the tests before updating this repository. It does not modify upstream's program code, mirror every upstream source commit, or publish an incompatible tool schema automatically.
+The **Refresh pins** GitHub workflow checks published npm releases every 6 hours. It verifies provenance and licenses, captures the tool contract, and runs the tests before updating this repository. It does not modify upstream's program code, mirror every upstream source commit, or publish an incompatible tool schema automatically. While `pocketFork` is set in `upstream.json`, the workflow keeps the speed fix pinned. When an npm release includes the fix, run `npm run refresh -- <version>` to return to npm and resume automatic pin updates.
 
 A gallery installation may download only releases pinned in its reviewed extension version. Update the extension through Pocket's normal extension updates, then use its Billion context menu to update the program. The menu does not fetch an arbitrary npm “latest” or update the extension itself behind Pocket's review process.
 
@@ -182,4 +182,4 @@ On shared machines, apply the repository owner's CPU limits to builds, pin gener
 
 This integration is MIT-licensed; see [LICENSE](LICENSE).
 
-It uses [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) and [acp-kernel](https://github.com/ranxianglei/acp-kernel) by ranxianglei. Related project: [billion-context](https://github.com/ranxianglei/billion-context). The downloaded program is unchanged upstream code. Upstream licenses and notices are preserved in the program archive and in [THIRD-PARTY-NOTICES.txt](billion-context-pi-pocket/THIRD-PARTY-NOTICES.txt); the menu also shows the attribution and full notices.
+It uses [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) and [acp-kernel](https://github.com/ranxianglei/acp-kernel) by ranxianglei. Related project: [billion-context](https://github.com/ranxianglei/billion-context). The `0.1.83-pocket.1` download adds only the [fork-host speed fix](https://github.com/ranxianglei/billion-context-pi/pull/698) to the upstream release. Upstream licenses and notices are preserved in the program archive and in [THIRD-PARTY-NOTICES.txt](billion-context-pi-pocket/THIRD-PARTY-NOTICES.txt); the menu also shows the attribution and full notices.

@@ -1,5 +1,5 @@
 /** Public HTTP menu routes and real Pocket context hand-off. Models and owner downloads are faked;
- * a clean checkout obtains the exact verified npm archive once as test data before installing fetch counters. */
+ * a clean checkout obtains the exact verified release archive once as test data before installing fetch counters. */
 import { pinArchiveCache } from "./env.ts";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -7,8 +7,9 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, test } from "node:test";
-import { repo, ENTRY, FILES, dropInFolder } from "./fixtures.ts";
+import { repo, ENTRY, FILES, dropInFolder, legacyRuntimeVersion } from "./fixtures.ts";
 import { pinnedTestArchive } from "./pinned-archive.mjs";
+import { runtimeRelease } from "../billion-context-pi-pocket/runtime.mjs";
 
 const pocketDir = process.env.PI_POCKET_CHECKOUT;
 const skip = pocketDir && existsSync(join(pocketDir, "test/helpers.ts")) ? false : "set PI_POCKET_CHECKOUT to a Pi Pocket checkout";
@@ -22,6 +23,9 @@ const trace = { messages: [] as readonly any[], requests: 0, native: 0 };
 const textOf = (messages: readonly any[]) => messages.map((message) => JSON.stringify(message.content)).join("\n");
 const lock = JSON.parse(readFileSync(join(repo, FILES, "runtime-lock.json"), "utf8"));
 const pin = lock.releases.find((value: any) => value.version === lock.current);
+const { baseVersion, redirectHost } = runtimeRelease(pin.version);
+const assetUrl = redirectHost ? `https://${redirectHost}/fixture.tgz?signature=test` : undefined;
+const pinLabel = redirectHost ? `${baseVersion} + speed fix (vitalNohj fork)` : pin.version;
 
 function scriptedModel() {
     return h.scriptedModel((request: any) => {
@@ -92,9 +96,9 @@ async function withApi(target: any, action: (api: any) => Promise<void>) {
     finally { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); }
 }
 
-async function withFreshInstall(name: string, action: (fixture: any) => Promise<void>) {
+async function withFreshInstall(name: string, action: (fixture: any) => Promise<void>, includeLegacy = false) {
     const directory = join(h.root, name);
-    dropInFolder(join(directory, "extensions"), {}, false);
+    dropInFolder(join(directory, "extensions"), {}, includeLegacy);
     const archive = await pinnedTestArchive(pin, { cacheDir: pinArchiveCache });
     const originalFetch = globalThis.fetch;
     let downloads = 0;
@@ -103,9 +107,15 @@ async function withFreshInstall(name: string, action: (fixture: any) => Promise<
     const mockedFetch = (async (input: any, options: any) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         urls.push(url);
-        if (url !== pin.tarball) return originalFetch(input, options);
-        downloads += 1;
-        if (offline) throw new Error("OFFLINE_TEST");
+        if (url === pin.tarball) {
+            downloads += 1;
+            if (offline) throw new Error("OFFLINE_TEST");
+            if (assetUrl) {
+                assert.equal(options.redirect, "manual");
+                return new Response(null, { status: 302, headers: { location: assetUrl } });
+            }
+        } else if (url !== assetUrl) return originalFetch(input, options);
+        assert.equal(options.redirect, "error");
         return new Response(archive, { status: 200, headers: { "content-length": String(archive.length) } });
     }) as typeof fetch;
     globalThis.fetch = mockedFetch;
@@ -129,6 +139,9 @@ test("owner menu installs only after a click, rejects unpinned input, and uninst
             const initial = await api("status");
             assert.equal(initial.runtime.state, "absent");
             assert.equal(initial.runtime.installed, false);
+            assert.equal(initial.runtime.availableVersionLabel, pinLabel);
+            assert.equal(initial.runtime.host, redirectHost ? "github.com" : "registry.npmjs.org");
+            assert.equal(initial.runtime.redirectHost, redirectHost);
             assert.equal(fixture.downloads(), 0, "module load and menu status never install");
             assert.deepEqual(initial.extension, { version: pin.version, source: "manual" });
             assert.deepEqual(initial.updates, { available: false }, "no update request is sent before a click");
@@ -145,7 +158,9 @@ test("owner menu installs only after a click, rejects unpinned input, and uninst
             assert.equal(installed.runtime.installed, true);
             assert.equal(installed.runtime.managed, true);
             assert.equal(installed.runtime.version, pin.version);
+            assert.equal(installed.runtime.versionLabel, pinLabel);
             assert.equal(fixture.downloads(), 1, JSON.stringify({ urls: fixture.urls, sameFetch: fixture.sameFetch() }));
+            if (assetUrl) assert.ok(fixture.urls.includes(assetUrl), "installer followed the release asset redirect");
             assert.equal(existsSync(join(fixture.directory, "extensions", FILES, `billion-context-pi-${pin.version}`)), false, "the program is not inside gallery files");
             const id = await h.newSession(fixture.app);
             await say(fixture.app, id, "read A");
@@ -170,6 +185,25 @@ test("owner menu installs only after a click, rejects unpinned input, and uninst
             assert.doesNotMatch(textOf(trace.messages), /OLD_LOG_A/);
         });
     });
+});
+
+test("the speed fix restores a fork from a checkpoint saved by the npm engine", { skip: skip || !redirectHost, timeout: 30_000 }, async () => {
+    await withFreshInstall("upgrade-legacy-to-speed-fix", async (fixture) => {
+        const id = await h.newSession(fixture.app);
+        await say(fixture.app, id, "read A");
+        await say(fixture.app, id, "fold A");
+        await withApi(fixture.app, async (api) => {
+            assert.equal((await api("status")).runtime.version, legacyRuntimeVersion());
+            assert.equal((await api("runtime/install", {})).runtime.version, pin.version);
+        });
+        const parent = await fixture.app.harness.conversation(id, h.context);
+        const at = (await parent.entries({}, 1, undefined, h.context)).items[0].id;
+        const child = await parent.fork(at, { ownership: { kind: "ownerless" } }, h.context);
+        await (await child.submit({ type: "input", content: [{ type: "text", text: "continue" }] }, h.context)).wait(h.context);
+        assert.equal(saved(fixture.directory, child.id).value.derivedFrom.parentSessionId, String(id));
+        assert.match(textOf(trace.messages), /SUMMARY_A/);
+        assert.doesNotMatch(textOf(trace.messages), /OLD_LOG_A/);
+    }, true);
 });
 
 test("verified installed programs and saved compression work after an offline restart", { skip, timeout: 30_000 }, async () => {

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { lstat, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { root, stableVersion, isNewer } from '../scripts/upstream.mjs';
+import { root, stableVersion, isNewer, reviewedFork } from '../scripts/upstream.mjs';
 import { validatePin } from '../billion-context-pi-pocket/runtime.mjs';
 import { executableFiles, assertCompatibleContract } from '../scripts/pin-contract.mjs';
 const json = async (path) => JSON.parse(await readFile(join(root, path), 'utf8'));
@@ -18,19 +18,30 @@ test('stable release checks reject prereleases and downgrades', () => {
 test('reviewed pins, release provenance and contract agree', async () => {
     const [lock, upstream, pkg, contract] = await Promise.all(['billion-context-pi-pocket/runtime-lock.json', 'upstream.json', 'package.json', 'billion-context-pi-pocket/tool-contract.json'].map(json));
     assert.equal(lock.format, 1); assert.equal(lock.package, 'billion-context-pi');
-    assert.equal(lock.current, upstream.version); assert.equal(pkg.version, lock.current);
-    assert.equal(pkg.devDependencies['billion-context-pi'], lock.current);
+    const fork = reviewedFork(upstream);
+    assert.equal(lock.current, fork?.version ?? upstream.version);
+    assert.equal(pkg.version, upstream.version);
+    assert.equal(pkg.devDependencies['billion-context-pi'], upstream.version);
     assert.equal(new Set(lock.releases.map((p) => p.version)).size, lock.releases.length);
-    for (const pin of lock.releases) validatePin(pin);
-    const pin = lock.releases.find((p) => p.version === lock.current);
-    assert.ok(pin); assert.equal(pin.integrity, upstream.npmIntegrity);
-    assert.ok(pin.executableFiles && typeof pin.executableFiles === 'object' && !Array.isArray(pin.executableFiles));
-    const executablePaths = Object.keys(pin.executableFiles);
-    assert.deepEqual(executablePaths, [...executablePaths].sort());
-    assert.ok(executablePaths.includes('package.json'));
-    for (const path of executablePaths) {
-        assert.ok(path === 'package.json' || /\.(?:js|mjs|cjs)$/.test(path));
-        assert.match(pin.executableFiles[path], /^[a-f0-9]{64}$/);
+    const npm = lock.releases.find((p) => p.version === upstream.version);
+    const current = lock.releases.find((p) => p.version === lock.current);
+    assert.ok(npm && current);
+    assert.equal(npm.integrity, upstream.npmIntegrity);
+    if (fork) {
+        assert.equal(current.tarball, fork.tarball);
+        assert.equal(current.integrity, fork.integrity);
+    }
+    for (const pin of lock.releases) {
+        validatePin(pin);
+        assert.ok(pin.archiveBytes > 0 && pin.unpackedBytes > 0);
+        assert.ok(pin.executableFiles && typeof pin.executableFiles === 'object' && !Array.isArray(pin.executableFiles));
+        const executablePaths = Object.keys(pin.executableFiles);
+        assert.deepEqual(executablePaths, [...executablePaths].sort());
+        assert.ok(executablePaths.includes('package.json'));
+        for (const path of executablePaths) {
+            assert.ok(path === 'package.json' || /\.(?:js|mjs|cjs)$/.test(path));
+            assert.match(pin.executableFiles[path], /^[a-f0-9]{64}$/);
+        }
     }
     assert.match(upstream.commit, /^[a-f0-9]{40}$/);
     assert.equal(contract.format, 1); assert.equal(contract.package, lock.package); assert.equal(contract.version, lock.current);

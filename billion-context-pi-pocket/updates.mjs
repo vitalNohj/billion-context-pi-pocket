@@ -7,10 +7,10 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { runtimeRelease } from './runtime.mjs';
 
 export const REPOSITORY = 'vitalNohj/billion-context-pi-pocket';
 const BRANCH = 'main';
-const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const CHECK_TIMEOUT = 20_000;
 
@@ -118,7 +118,8 @@ export class UpdateState {
       if (!COMMIT.test(sha)) throw new Error('GitHub did not return a valid commit.');
       // Hand-copied files compare versions, so a check without the version is incomplete.
       const lock = await (await this.#get(`https://raw.githubusercontent.com/${REPOSITORY}/${sha}/billion-context-pi-pocket/runtime-lock.json`, 'application/json', signal)).json();
-      if (typeof lock?.current !== 'string' || !VERSION.test(lock.current)) throw new Error('The newest version has no valid runtime-lock.json.');
+      try { runtimeRelease(lock?.current); }
+      catch { throw new Error('The newest version has no valid runtime-lock.json.'); }
       return { commit: sha, version: lock.current };
     } catch (error) {
       throw signal.aborted ? new Error('GitHub did not answer in time. Try again later.') : error;
