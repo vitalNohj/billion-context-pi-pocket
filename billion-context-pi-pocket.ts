@@ -69,6 +69,10 @@ type Profile = { enabled: boolean; offBehavior?: OffBehavior };
 const TOOL_NAMES = ["compress", "decompress", "search_context", "acp_status", "acp_cache"];
 const CONTEXT_ONLY = new Set(["compress", "search_context", "acp_status", "acp_cache"]);
 const offBehavior = (value: unknown): value is OffBehavior => value === "keep-summaries" || value === "restore-history";
+const RETENTION = {
+    more: { minPercent: 40, growthTokens: 300_000 },
+    most: { minPercent: 60, growthTokens: 450_000 },
+} as const;
 const json = (file: string) => JSON.parse(readFileSync(file, "utf8"));
 const lock = json(join(files, "runtime-lock.json"));
 if (lock.format !== 1 || lock.package !== "billion-context-pi" || !Array.isArray(lock.releases)) throw new Error("Invalid runtime lock");
@@ -191,6 +195,20 @@ export function withoutNewNudges(messages: readonly any[], original: readonly an
 const withPrompt = (messages: readonly any[], text: string | undefined) => text
     ? [{ role: "system", content: text }, ...messages] : messages;
 
+function withRetention(text: string | undefined, minPercent: number | undefined) {
+    if (!text || minPercent === undefined) return text;
+    const rule = `Only compress on your own if context use is at least ${minPercent}% of the window. `
+        + "If an ACP compression reminder asks you to compress, follow it at any usage level.";
+    // BCP snapshots promptSections on config reload. Change the rendered guidance instead, preserving the pack
+    // and all its other text. In lean the timing guidance is in acpTags, not the tool description or its own section.
+    const lean = "\nCompress consumed history with compress:";
+    if (text.includes(lean)) return text.replace(lean, `\n${rule} When allowed, use compress for consumed history:`);
+    const heading = "\n\nWHEN TO COMPRESS\n\n";
+    const defaultTiming = "Use when content is genuinely consumed (no longer needed for the current task step).";
+    const prompt = text.replace(defaultTiming, "Use only for genuinely consumed content and follow WHEN TO COMPRESS.");
+    return prompt.includes(heading) ? prompt.replace(heading, `${heading}${rule}\n\n`) : `${prompt}\nWHEN TO COMPRESS\n\n${rule}\n`;
+}
+
 export default function billionContextPiPocket(host: Host, web?: any) {
     const extensionName = settings.extensionName ?? "billion-context-pi";
     const stateDir = isAbsolute(settings.stateDir ?? "") ? settings.stateDir : join(host.dataDir, settings.stateDir ?? "billion-context-pi");
@@ -238,7 +256,7 @@ export default function billionContextPiPocket(host: Host, web?: any) {
                 process.env.PI_ACP_FORK_HOST = "1";
                 process.env.ACP_AUTO_UPDATE = "0";
                 const module = await import(pathToFileURL(join(value.packageDir, "dist/index.js")).href);
-                if (typeof module.default !== "function" || typeof module.deriveChildState !== "function") throw new Error("Installed BCP lacks the integration API");
+                if (typeof module.createAcpExtension !== "function" || typeof module.deriveChildState !== "function") throw new Error("Installed BCP lacks the integration API");
                 return { ...value, key, module };
             })().catch((error) => { modules.delete(key); throw error; }));
         }
@@ -334,12 +352,16 @@ export default function billionContextPiPocket(host: Host, web?: any) {
                 return { messages: withPrompt(request.messages, "Billion context is not installed. Do not use its tools. The owner can install it through Menu → Billion context.") };
             }
             requestKeys.set(taskKey(api), value.key);
+            const level = mode.enabled ? web?.setting?.("contextRetention") : undefined;
+            const retention = level === "more" || level === "most" ? RETENTION[level] : undefined;
+            value.options.nudgeGrowthTokens = retention?.growthTokens;
             await value.extension.prepare(request, api, context);
             const agent = await api.snapshot(AgentDoc, api.conversationId, context);
             // Render after both context-boundary detection and fork restoration, including paused summary lists.
-            const text = mode.enabled
+            const prompt = mode.enabled
                 ? await value.extension.sections[0].render({ conversationId: api.conversationId, agent, read: api, shown: {} }, context)
                 : await pausedPrompt(api.conversationId);
+            const text = withRetention(prompt, retention?.minPercent);
             value.options.systemPrompt = text;
             const output = await value.generation.beforeRequest(request, api, context);
             const messages = output?.messages ?? request.messages;
@@ -394,9 +416,14 @@ export default function billionContextPiPocket(host: Host, web?: any) {
 
     if (web) {
         if (typeof web.conversationRoute !== "function" || typeof web.settings !== "function") throw new Error("Billion context requires Pi Pocket 0.27.0 or newer");
-        web.settings([{ name: "offBehavior", label: "Default behavior when switched off", type: "choice",
-            default: settings.offBehavior ?? "restore-history", description: "Each chat can override this. Restoring history hands context management back to Pocket on its next request.",
-            choices: [{ value: "restore-history", label: "Restore original history — use Pocket compaction" }, { value: "keep-summaries", label: "Keep existing summaries — stop new compression" }] }]);
+        web.settings([
+            { name: "offBehavior", label: "Default behavior when switched off", type: "choice",
+                default: settings.offBehavior ?? "restore-history", description: "Each chat can override this. Restoring history hands context management back to Pocket on its next request.",
+                choices: [{ value: "restore-history", label: "Restore original history — use Pocket compaction" }, { value: "keep-summaries", label: "Keep existing summaries — stop new compression" }] },
+            { name: "contextRetention", label: "Context kept before compressing", type: "choice", default: "standard",
+                description: "Higher levels keep more chat history, which makes requests larger and more costly.",
+                choices: [{ value: "standard", label: "Standard" }, { value: "more", label: "More" }, { value: "most", label: "Most" }] },
+        ]);
         web.client("billion-context-pi-pocket");
         const changed = () => web.send("changed", {});
         web.onSettings?.(changed);

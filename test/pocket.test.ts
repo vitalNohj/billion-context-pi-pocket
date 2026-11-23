@@ -299,6 +299,89 @@ test("settings: the state folder and extension name are configurable", { skip },
     assert.equal(existsSync(join(folder, "bcp")), false, "loading the installer does not create or rewrite ACP state");
 });
 
+test("Pocket retention changes lean guidance and the engine growth step on the next request", { skip }, async () => {
+    const { newSession, owner, say, work } = h;
+    const module = ADAPTER.slice(0, -3);
+    const { fields, values } = app.extensionSettings(owner(app), module);
+    const field = fields.find((item: any) => item.name === "contextRetention");
+    assert.equal(field.type, "choice");
+    assert.equal(field.label, "Context kept before compressing");
+    assert.equal(values.contextRetention, "standard");
+    assert.deepEqual(field.choices.map((item: any) => item.value), ["standard", "more", "most"]);
+
+    const cwd = mkdtempSync(join(work, "retention-"));
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "acp.json"), JSON.stringify({ compress: { promptPack: "lean" } }));
+    const id = await newSession(app, cwd);
+    const another = await newSession(app, cwd);
+    await say(app, id, "read A");
+    await say(app, id, "fold A");
+    const blocks = blockContent(id);
+    const refs = state(id).messageRefs.byRaw;
+    const prompt = (): string => lastRequest.find((m: any) => m.role === "system"
+        && typeof m.content === "string" && m.content.startsWith("ACP context management"))?.content;
+    const growth = (sid: string, step: number) => {
+        const line = readFileSync(process.env.ACP_LOG_FILE!, "utf8").split("\n")
+            .findLast((line) => line.includes(` [turn] sid=${sid} `));
+        assert.match(line ?? "", new RegExp(`< threshold ${step}\\b`));
+    };
+    const standard = prompt();
+    const leanTiming = "Compress consumed history with compress:";
+    assert.ok(standard?.includes(leanTiming), "the upstream lean timing guidance reaches the model");
+    growth(id, 50_000);
+    await say(app, another, "Other chat, same default");
+    assert.equal(prompt(), standard);
+
+    const set = (value: string) => app.setExtensionSettings(owner(app), module, { contextRetention: value });
+    try {
+        for (const [level, percent, step] of [["more", 40, 300_000], ["most", 60, 450_000]] as const) {
+            set(level);
+            const expected = standard.replace(leanTiming,
+                `Only compress on your own if context use is at least ${percent}% of the window. `
+                + "If an ACP compression reminder asks you to compress, follow it at any usage level. "
+                + "When allowed, use compress for consumed history:");
+            for (const sid of [id, another]) {
+                await say(app, sid, "Continue the discussion");
+                assert.equal(prompt(), expected, "only the lean timing guidance changes");
+                growth(sid, step);
+            }
+            assert.equal(blockContent(id), blocks, "the same summary and block IDs remain active");
+            const currentRefs = state(id).messageRefs.byRaw;
+            for (const [raw, ref] of Object.entries(refs)) assert.equal(currentRefs[raw], ref);
+        }
+    } finally {
+        set("standard");
+    }
+    await say(app, id, "Continue with standard retention");
+    assert.equal(prompt(), standard);
+    growth(id, 50_000);
+});
+
+test("standard and invalid retention leave the complete default request unchanged", { skip }, async () => {
+    const host = { dataDir: mkdtempSync(join(testHome, "retention-default-")), notice() {} };
+    let level: unknown;
+    const generation = (extension: any) => extension.hooks.find((hk: any) => hk.handlers.beforeRequest).handlers;
+    const current = generation(mod.default(host, {
+        settings() {}, client() {}, route() {}, conversationRoute() {},
+        setting(name: string) { return name === "contextRetention" ? level : undefined; },
+    }));
+    const api = fakeApi("900002");
+    const request = { messages: [{ role: "user", content: "Short history", timestamp: 1 }] };
+    const before = await generation(mod.default(host)).beforeRequest(request, api, h.context);
+    assert.match(before.messages[0].content, /WHEN TO COMPRESS\n\n- A sub-agent/);
+    for (const [value, percent] of [["more", 40], ["most", 60]] as const) {
+        level = value;
+        const after = await current.beforeRequest(request, api, h.context);
+        assert.match(after.messages[0].content, new RegExp(`WHEN TO COMPRESS\\n\\nOnly compress on your own if context use is at least ${percent}%`));
+        assert.deepEqual(after.messages.slice(1), before.messages.slice(1));
+    }
+    for (const value of ["standard", undefined, "unknown", 450_000, { level: "most" }]) {
+        level = value;
+        const after = await current.beforeRequest(request, api, h.context);
+        assert.equal(JSON.stringify(after), JSON.stringify(before));
+    }
+});
+
 test("the gallery entry loads without a runtime and does not install during loading", { skip }, async () => {
     const folder = mkdtempSync(join(testHome, "missing-"));
     symlinkSync(join(pocketDir!, "node_modules"), join(folder, "node_modules"), "dir");

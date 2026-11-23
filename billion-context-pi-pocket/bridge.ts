@@ -453,10 +453,20 @@ function json(value: unknown): any {
     }
 }
 
+type BridgeOptions = {
+    stateDir: string;
+    extensionName: string;
+    epoch: number;
+    generation?: number;
+    replayFloor?: number;
+    contextId?: string;
+    systemPrompt?: string;
+    nudgeGrowthTokens?: number;
+};
+
 /** Pi Pocket calls this synchronously: everything asynchronous happens at import or in the hooks. */
-export function createBridge(host: Host, bcp: any, version: string, options: { stateDir: string; extensionName: string; epoch: number; generation?: number; replayFloor?: number; contextId?: string; systemPrompt?: string }) {
+export function createBridge(host: Host, bcp: any, version: string, options: BridgeOptions) {
     const { stateDir, extensionName } = options;
-    const factory = bcp.default;
     const deriveChildState = bcp.deriveChildState;
     mkdirSync(stateDir, { recursive: true });
 
@@ -487,7 +497,16 @@ export function createBridge(host: Host, bcp: any, version: string, options: { s
         has: (target, key) => key in target,
     });
 
-    factory(api);
+    bcp.createAcpExtension({
+        // BCP retains coreOverrides across acp.json reloads. Its compress.nudgeGrowthTokens maps to these
+        // same two fields, but a factory `compress` object would be replaced by any `compress` in acp.json.
+        coreOverrides: {
+            get nudge() {
+                const growth = options.nudgeGrowthTokens;
+                return growth === undefined ? undefined : { growthFloor: growth, growthCap: growth };
+            },
+        },
+    })(api);
 
     // ---- per-conversation pi context ----
 

@@ -67,6 +67,20 @@ While BCP is on, it continues to decline Pocket's native compaction, including m
 
 If the program is missing or damaged, you can still switch the chat off and choose Restore original history. Recovery must not trap you behind a disabled switch.
 
+## Keep more chat history
+
+In **Menu → Extensions → Billion context**, set **Context kept before compressing**:
+
+| Level | When the model can start compression on its own | Growth reminder step |
+| --- | --- | --- |
+| **Standard** (default) | No change to Billion Context's usual guidance | Unchanged |
+| **More** | From 40% of the context window | 300,000 tokens |
+| **Most** | From 60% of the context window | 450,000 tokens |
+
+The model can still follow a compression reminder below these levels. The forced reminder (75% by default) and emergency truncation (95% by default) do not change. An explicit `compress.nudgeGrowthTokens` in ACP's own configuration still takes precedence over the Pocket growth step.
+
+Higher levels keep more history, so requests can be larger and cost more. This setting applies on the next request in every chat with Billion Context on. It does not restore or change saved summaries, and it does not change terminal Pi's settings.
+
 ## Existing installations and forks
 
 Existing `extensionName` and `stateDir` settings are preserved. Updating the program does not rename your stored extension identity, move the ACP directory, or delete checkpoints. A verified older bundled copy can continue working until you explicitly install the managed program. Uninstall records an explicit opt-out, so it does not silently reactivate that legacy copy.
